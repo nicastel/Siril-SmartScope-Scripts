@@ -1,0 +1,45 @@
+############################################
+#
+# Script for Siril 1.2
+# February 2023
+# (C) Cyril Richard
+# OSC_Preprocessing_WithDrizzle v1.3
+#
+########### PREPROCESSING SCRIPT ###########
+#
+# Script for color camera preprocessing
+# aligning using Drizzle 2x
+#
+# Assume the master dark to use is
+# in ../wdax94_DarkframeMean
+#
+############################################
+
+requires 1.2.0
+
+# Convert Light Frames to .fit files
+cd StackInput
+convert light -out=../../process
+
+# Convert Dark Frames to .fit files
+cd ../../wdax94_DarkframeMean
+link dark -out=../process
+cd ../process
+
+# Calibrate Light Frames
+calibrate light -dark=dark_00001.fit -cc=dark -cfa -equalize_cfa -debayer
+
+# Align lights with drizzle 2x in 2 pass
+register pp_light -2pass -drizzle
+seqapplyreg pp_light -drizzle -framing=max
+
+# Stack calibrated lights to result.fit
+stack r_pp_light rej 3 3 -norm=addscale -output_norm -rgb_equal -filter-wfwhm=90% -out=result
+
+# and flipping if required
+load result
+mirrorx -bottomup
+save ../result/result_drizzle_DarkFrameMean_$LIVETIME:%d$s
+
+cd ..
+close

@@ -1,0 +1,42 @@
+############################################
+# Script for Siril 1.0
+# August 2020
+# (C) Cyril Richard / Colmic
+# OSC_Preprocessing_WithoutDBF v1.0
+# modified for Seestar, no lights folder
+# required 
+# and drizzle added
+#
+########### PREPROCESSING SCRIPT ###########
+# Script for color camera preprocessing
+# with drizzle
+# needs 1 set of RAW images in the working
+# directory
+#
+# note : remove the xx_thn.jpg files from 
+# the working folder first
+#
+############################################
+
+requires 1.2.0
+
+#preprocess lights
+link light -out=process
+cd process
+preprocess light -debayer
+
+# Align lights with drizzle 2x in 2 pass
+register pp_light -2pass -drizzle
+seqapplyreg pp_light -drizzle -framing=max
+
+#stack calibrated lights
+# rgb_equal or not?
+stack r_pp_light rej 3 3 -norm=addscale -output_norm -rgb_equal -filter-wfwhm=90% -out=result
+
+# and flipping if required
+load result
+mirrorx -bottomup
+save ../result/result_drizzle_$LIVETIME:%d$s
+
+cd ..
+close
