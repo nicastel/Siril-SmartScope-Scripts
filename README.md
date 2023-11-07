@@ -1,0 +1,1 @@
+# Siril-SmartScope-Scripts
