@@ -21,7 +21,7 @@ requires 1.2.0
 #preprocess lights
 link light -out=process
 cd process
-preprocess light -debayer
+calibrate light -cfa -equalize_cfa -debayer
 
 # Align lights with drizzle 2x in 2 pass
 register pp_light -2pass -drizzle
