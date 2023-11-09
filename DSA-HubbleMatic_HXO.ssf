@@ -1,0 +1,73 @@
+############################################
+# 09/11/2023
+# HubbleMatic_HXO v1.0
+# Modification of the HubbleMatic script
+# from DSA to implement an HXO combination 
+# (faux SHO) using the formula
+# ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
+# from
+# https://thecoldestnights.com/2020/06/pixinsight-dynamic-narrowband-combinations-with-pixelmath/?fbclid=IwAR1_YtLbAGGBoL-N-I7E8vIqsgB4o_mOwOSr-5F7RpXY4zrQzfmsnzB4lYU
+# via pixel math
+#
+# BASED ON
+#
+# Feb. 25, 2023
+# [DSA] HubbleMatic v1.0
+# Script for assisting in creating a faux
+# Hubble palette image using one shot color data.
+# Recommended to crop your image first before running
+#  this script.
+#
+# How to use this script:
+# https://youtu.be/s3TJduagxrw
+#
+##############################################
+requires 1.2.0
+
+#Background extraction
+subsky -rbf -smooth=0.5 -samples=10
+
+#Remove green noise
+rmgreen
+
+#AutoStretch the image
+autostretch
+
+# Split channels into Red, Green, & Blue files
+# These files are created in the working directory
+# and can be deleted when the script finishes.
+split Ha Oiii B
+
+# Renorm OIII to Ha using PixelMath
+pm $Oiii$*mad($Ha$)/mad($Oiii$)-mad($Ha$)/mad($Oiii$)*median($Oiii$)+median($Ha$)
+save Oiii_renorm
+
+# Create an extra blue band using PixelMath
+pm "(($Oiii$*$Ha$)^~($Oiii$*$Ha$))*$Ha$ + ~(($Oiii$*$Ha$)^~($Oiii$*$Ha$))*$Oiii$"
+save fakeblue
+
+#Create the RGB composite from the split channel files
+rgbcomp -lum=Ha.fit Ha.fit fakeblue.fit Oiii_renorm.fit
+
+# Load the completed file
+load composed_lrgb.fit
+
+#Remove green noise
+rmgreen
+
+#Increase global saturation
+satu 1 0
+
+######################################################################
+#   ___                 ____                    ___       __         #
+#  / _ \___ ___ ___    / __/__  ___ ________   / _ | ___ / /________ #
+# / // / -_) -_) _ \  _\ \/ _ \/ _ `/ __/ -_) / __ |(_-</ __/ __/ _ \#
+#/____/\__/\__/ .__/ /___/ .__/\_,_/\__/\__/ /_/ |_/___/\__/_/  \___/#
+#            /_/        /_/                                          #
+#                                                                    #
+# YouTube https://www.youtube.com/@DeepSpaceAstro                    #
+# Instagram https://www.instagram.com/deepspaceastro_official/       #
+# FaceBook https://www.facebook.com/DeepSpaceAstro/                  #
+# TikTok https://www.tiktok.com/@DeepSpaceAstro                      # 
+######################################################################
+
