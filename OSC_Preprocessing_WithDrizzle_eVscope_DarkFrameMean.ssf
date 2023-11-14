@@ -22,9 +22,9 @@ cd StackInput
 convert light -out=../../process
 
 # Convert Dark Frames to .fit files
-cd ../../wdax94_DarkframeMean
-link dark -out=../process
-cd ../process
+cd ..
+link dark -out=process
+cd process
 
 # Calibrate Light Frames
 calibrate light -dark=dark_00001.fit -cc=dark -cfa -equalize_cfa -debayer
