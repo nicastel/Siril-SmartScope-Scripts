@@ -1,0 +1,38 @@
+############################################
+# Script for Siril 1.0
+# August 2020
+# (C) Cyril Richard / Colmic
+# OSC_Preprocessing_WithoutDBF v1.0
+# modified, no lights folder
+# required 
+#
+########### PREPROCESSING SCRIPT ###########
+# Script for color camera stacking 
+# of already stacked images
+# needs 1 set of stacked images in the working
+# directory
+#
+#
+############################################
+
+requires 1.2.0
+
+#preprocess lights
+link light -out=process
+cd process
+calibrate light -cfa -equalize_cfa -debayer
+
+# Align lights with drizzle 2x in 2 pass
+register pp_light -2pass
+seqapplyreg pp_light -framing=max
+
+#stack calibrated lights
+stack r_pp_light rej 3 3 -norm=addscale -output_norm -out=result
+
+# and flipping if required
+load result
+mirrorx -bottomup
+save ../result/result_multistack_$LIVETIME:%d$s
+
+cd ..
+close
