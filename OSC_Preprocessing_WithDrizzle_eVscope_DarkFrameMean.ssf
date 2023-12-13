@@ -17,6 +17,8 @@
 
 requires 1.2.0
 
+setcompress 1 -type=rice 16
+
 # Convert Light Frames to .fit files
 cd StackInput
 convert light -out=../../process
@@ -39,7 +41,7 @@ stack r_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=resu
 # and flipping if required
 load result
 mirrorx -bottomup
-save ../result/result_drizzle_DarkFrameMean_$LIVETIME:%d$s
+save ../result/siril_result_drizzle_DarkFrameMean_$LIVETIME:%d$s
 
 cd ..
 close
