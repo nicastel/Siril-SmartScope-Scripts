@@ -40,6 +40,8 @@ seqapplyreg pp_light -drizzle -framing=max
 # Stack calibrated lights to result.fit
 stack r_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=result
 
+setcompress 0
+
 # and flipping if required
 load result
 mirrorx -bottomup
