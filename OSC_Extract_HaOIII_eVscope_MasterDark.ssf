@@ -69,7 +69,7 @@ mirrorx_single results_00002
 
 # Align the result images, small shifts and chromatic aberrations can occur
 register results -2pass
-seqapplyreg results -framing=min
+seqapplyreg results -framing=max
 
 setcompress 0
 
