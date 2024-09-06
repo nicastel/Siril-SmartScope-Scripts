@@ -19,19 +19,19 @@ requires 1.2.0
 
 setcompress 1 -type=rice 16
 
-# Convert Light Frames to .fit files
-cd StackInput
-convert light -out=../../process
+# Convert Lights Frames to .fit files
+cd Lights
+convert light -out=../process
 
 # Convert Dark Frames to .fit files
-cd ../../master_dark/StackInput
-convert dark -out=../../process
-cd ../../process
+cd ../Darks
+convert dark -out=../process
+cd ../process
 
 # Stack Dark Frames to dark_stacked.fit
-stack dark rej 3 3 -nonorm -out=../master_dark/dark_stacked
+stack dark rej 3 3 -nonorm -out=dark_stacked
 # Calibrate Light Frames
-calibrate light -dark=../master_dark/dark_stacked -cc=dark -cfa -equalize_cfa -debayer
+calibrate light -dark=dark_stacked -cc=dark -cfa -equalize_cfa -debayer
 
 #cut the left part
 seqcrop pp_light 7 0 1296 976
