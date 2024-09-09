@@ -1,0 +1,76 @@
+############################################
+#
+# Script for Siril 1.2
+# February 2023
+# (C) Cyril Richard
+# OSC_Preprocessing_WithDrizzle v1.3
+#
+########### PREPROCESSING SCRIPT ###########
+#
+# Script for eVscope 1 preprocessing
+# aligning using Drizzle 2x in 2 pass
+#
+#
+############################################
+
+requires 1.2.0
+
+setcompress 1 -type=rice 16
+
+# Convert Lights Frames to .fit files
+cd Lights
+convert light -out=../process
+
+# Convert Bias Frames to .fit files
+cd ../Biases
+convert bias -out=../process
+cd ../process
+
+# Stack Bias Frames to bias_stacked.fit
+stack bias rej 3 3 -nonorm
+cd ..
+
+# Convert Flat Frames to .fit files
+cd Flats
+convert flat -out=../process
+cd ../process
+
+# Pre-process Flat Frames
+preprocess flat -bias=bias_stacked
+
+# Stack Flat Frames to pp_flat_stacked.fit
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+
+# Convert Dark Frames to .fit files
+cd Darks
+convert dark -out=../process
+cd ../process
+
+# Stack Dark Frames to dark_stacked.fit
+stack dark rej 3 3 -nonorm -out=dark_stacked
+# Calibrate Light Frames
+calibrate light -dark=dark_stacked -flat=pp_flat_stacked -cfa -equalize_cfa -debayer
+
+#cut the left part
+seqcrop pp_light 7 0 1296 976
+
+# Extract linear gradient
+seqsubsky cropped_pp_light 1
+
+# Align lights with drizzle 2x in 2 pass
+register bkg_cropped_pp_light -2pass -drizzle
+seqapplyreg bkg_cropped_pp_light -drizzle -framing=max
+
+# Stack calibrated lights to result.fit
+stack r_bkg_cropped_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=result
+
+setcompress 0
+
+# and flipping if required
+load result
+mirrorx -bottomup
+save ../result/siril_result_drizzle_master_dark_$LIVETIME:%d$s
+
+cd ..
+close
