@@ -23,7 +23,7 @@ cd Lights
 convert light -out=../process
 
 # Convert Dark Frames to .fit files
-cd ../../Darks/StackInput
+cd ../Darks/StackInput
 convert dark -out=../process
 cd ../process
 
