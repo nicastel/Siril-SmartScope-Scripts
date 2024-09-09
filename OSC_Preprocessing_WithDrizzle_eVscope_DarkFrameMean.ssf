@@ -20,12 +20,12 @@ requires 1.2.0
 setcompress 1 -type=rice 16
 
 # Convert Light Frames to .fit files
-cd StackInput
-convert light -out=../../process
+cd Lights
+convert light -out=../process
 
 # Convert Dark Frames to .fit files
-cd ..
-link dark -out=process
+cd Darks
+link dark -out=../process
 cd process
 
 # Calibrate Light Frames
