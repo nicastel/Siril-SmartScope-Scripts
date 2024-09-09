@@ -10,8 +10,6 @@
 # Script for eVscope 1 preprocessing
 # aligning using Drizzle 2x in 2 pass
 #
-# Needs a master_dark directory next to
-# the working directory
 #
 ############################################
 
