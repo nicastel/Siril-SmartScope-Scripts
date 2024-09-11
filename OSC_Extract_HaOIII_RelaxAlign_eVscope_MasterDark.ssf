@@ -51,7 +51,7 @@ register bkg_Ha_cropped_pp_light -2pass -drizzle
 seqapplyreg bkg_Ha_cropped_pp_light -drizzle -framing=max
 
 # Stack calibrated Ha lights to Ha_stack (temporary)
-stack r_bkg_Ha_cropped_pp_light rej 3 3 -norm=addscale -output_norm -rgb_equal -filter-wfwhm=90% -out=results_00001
+stack r_bkg_Ha_cropped_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=results_00001
 
 # and flip if required
 mirrorx_single results_00001
@@ -64,7 +64,7 @@ register bkg_OIII_cropped_pp_light -2pass -drizzle
 seqapplyreg bkg_OIII_cropped_pp_light -drizzle -framing=max
 
 # Stack calibrated OIII lights to OIII_stack (temporary)
-stack r_bkg_OIII_cropped_pp_light rej 3 3 -norm=addscale -output_norm -rgb_equal -filter-wfwhm=90% -out=results_00002
+stack r_bkg_OIII_cropped_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=results_00002
 
 # and flip if required
 mirrorx_single results_00002
