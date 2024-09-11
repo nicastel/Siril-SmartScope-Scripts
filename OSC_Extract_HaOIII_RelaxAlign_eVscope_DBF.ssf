@@ -1,0 +1,159 @@
+############################################
+#
+# Script for Siril 1.2
+# February 2023
+# (C) Cyril Richard
+# ExtractHaOIII v1.4
+#
+########### PREPROCESSING SCRIPT ###########
+#
+# Script for color camera preprocessing that
+# extracts Ha and OIII
+# Works on eVscope with a dual band filter
+#
+#
+############################################
+
+requires 1.2.0
+
+setcompress 1 -type=rice 16
+
+# Convert Lights Frames to .fit files
+cd Lights
+convert light -out=../process
+
+# Convert Bias Frames to .fit files
+cd ../Biases
+convert bias -out=../process
+cd ../process
+
+# Stack Bias Frames to bias_stacked.fit
+stack bias rej 3 3 -nonorm
+cd ..
+
+# Convert Flat Frames to .fit files
+cd Flats
+convert flat -out=../process
+cd ../process
+
+# Pre-process Flat Frames
+preprocess flat -bias=bias_stacked
+
+# Stack Flat Frames to pp_flat_stacked.fit
+stack pp_flat rej 3 3 -norm=mul
+cd ..
+
+# Convert Dark Frames to .fit files
+cd Darks
+convert dark -out=../process
+cd ../process
+
+# Stack Dark Frames to dark_stacked.fit
+stack dark rej 3 3 -nonorm -out=dark_stacked
+# Calibrate Light Frames
+calibrate light -dark=dark_stacked -flat=pp_flat_stacked -cfa
+
+#cut the left part
+seqcrop pp_light 7 0 1296 976
+
+# Extract Ha and OIII
+seqextract_HaOIII cropped_pp_light
+
+# Extract linear gradient
+seqsubsky Ha_cropped_pp_light 1
+
+setfindstar -relax=on -sigma=0.3 -roundness=0.4
+
+# Align Ha lights with drizzle 2x in 2 pass
+register bkg_Ha_cropped_pp_light -2pass -drizzle
+seqapplyreg bkg_Ha_cropped_pp_light -drizzle -framing=max
+
+# Stack calibrated Ha lights to Ha_stack (temporary)
+stack r_bkg_Ha_cropped_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=results_00001
+
+# and flip if required
+mirrorx_single results_00001
+
+# Extract linear gradient
+seqsubsky OIII_cropped_pp_light 1
+
+# Align OIII lights
+register bkg_OIII_cropped_pp_light -2pass -drizzle
+seqapplyreg bkg_OIII_cropped_pp_light -drizzle -framing=max
+
+# Stack calibrated OIII lights to OIII_stack (temporary)
+stack r_bkg_OIII_cropped_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=results_00002
+
+# and flip if required
+mirrorx_single results_00002
+
+# Align the result images, small shifts and chromatic aberrations can occur
+register results -2pass
+seqapplyreg results -framing=max
+
+setcompress 0
+setfindstar reset
+
+# Save Ha final result
+load r_results_00001
+save ../result/result_Ha_DBF_$LIVETIME:%d$s
+save Ha
+
+# Save Oiii final result
+load r_results_00002
+save ../result/result_OIII_DBF_$LIVETIME:%d$s
+save Oiii
+
+# Renorm OIII to Ha using PixelMath
+pm $Oiii$*mad($Ha$)/mad($Oiii$)-mad($Ha$)/mad($Oiii$)*median($Oiii$)+median($Ha$)
+save ../result/result_OIII_renorm_DBF_$LIVETIME:%d$s
+save Oiii_renorm
+
+# Create an extra blue band using PixelMath
+pm "(($Oiii$*$Ha$)^~($Oiii$*$Ha$))*$Ha$ + ~(($Oiii$*$Ha$)^~($Oiii$*$Ha$))*$Oiii$"
+save fakeblue
+
+#Create the HHO RGB composite from the split channel files
+rgbcomp -lum=Ha.fit Ha.fit Ha.fit Oiii_renorm.fit
+
+# Load the completed file
+load composed_lrgb.fit
+
+#Remove green noise
+rmgreen
+
+#Increase global saturation
+satu 1 0
+
+save ../result/result_HHO_$LIVETIME:%d$s
+
+#Create the HHO RGB composite from the split channel files
+rgbcomp Ha.fit Oiii_renorm.fit Oiii_renorm.fit
+
+# Load the completed file
+load composed_lrgb.fit
+
+#Remove green noise
+rmgreen
+
+#Increase global saturation
+satu 1 0
+
+save ../result/result_HOO_DBF_$LIVETIME:%d$s
+
+#Create the HXO composite from the split channel files
+rgbcomp -lum=Ha.fit Ha.fit fakeblue.fit Oiii_renorm.fit
+
+# Load the completed file
+load composed_lrgb.fit
+
+#Remove green noise
+rmgreen
+
+#Increase global saturation
+satu 1 0
+
+save ../result/result_HXO_DBF_$LIVETIME:%d$s
+
+
+close
