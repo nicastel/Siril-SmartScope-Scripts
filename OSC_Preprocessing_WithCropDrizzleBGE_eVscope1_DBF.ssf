@@ -70,7 +70,7 @@ setcompress 0
 # and flipping if required
 load result
 mirrorx -bottomup
-save ../result/siril_result_drizzle_master_dark_$LIVETIME:%d$s
+save ../result/siril_result_drizzle_dbf_$LIVETIME:%d$s
 
 cd ..
 close
