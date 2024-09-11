@@ -26,8 +26,6 @@ cd ../Darks
 link dark -out=../process
 cd ../process
 
-# Stack Dark Frames to dark_stacked.fit
-stack dark rej 3 3 -nonorm -out=dark_stacked
 # Calibrate Light Frames
 calibrate light -dark=dark_00001.fit -cc=dark -cfa -equalize_cfa -debayer
 
