@@ -30,7 +30,7 @@ seqsubsky pp_light 1
 
 # Align lights with drizzle 2x in 2 pass
 register bkg_pp_light -2pass -drizzle
-seqapplyreg bkg_pp_light -drizzle -framing=max
+seqapplyreg bkg_pp_light -drizzle -framing=max -filter-round=2.5k
 
 #stack calibrated lights
 stack r_bkg_pp_light rej 3 3 -norm=addscale -output_norm -filter-wfwhm=90% -out=result
