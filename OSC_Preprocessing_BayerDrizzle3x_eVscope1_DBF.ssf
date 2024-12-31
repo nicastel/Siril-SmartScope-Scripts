@@ -63,7 +63,7 @@ cd ../process
 calibrate light -dark=../masters/dark_stacked -flat=../masters/pp_flat_stacked -cc=dark -cfa -equalize_cfa
 
 # Align lights with Drizzle
-register pp_light -2pass -drizzle -scale=2.0 -pixfrac=0.5 -kernel=square -flat=../masters/pp_flat_stacked
+register pp_light -2pass -drizzle -scale=3.0 -pixfrac=0.33 -kernel=square -flat=../masters/pp_flat_stacked
 seqapplyreg pp_light -drizzle -scale=3.0 -pixfrac=0.33 -kernel=square -flat=../masters/pp_flat_stacked -framing=max
 
 # Stack calibrated lights to result.fit

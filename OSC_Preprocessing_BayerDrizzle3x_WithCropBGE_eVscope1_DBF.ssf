@@ -78,7 +78,7 @@ calibrate cropped_light -dark=../masters/dark_stacked -flat=../masters/pp_flat_s
 seqsubsky pp_cropped_light 1
 
 # Align lights with Drizzle
-register bkg_pp_cropped_light -2pass -drizzle -scale=2.0 -pixfrac=0.5 -kernel=square -flat=../masters/pp_flat_stacked
+register bkg_pp_cropped_light -2pass -drizzle -scale=3.0 -pixfrac=0.33 -kernel=square -flat=../masters/pp_flat_stacked
 seqapplyreg bkg_pp_cropped_light -drizzle -scale=3.0 -pixfrac=0.33 -kernel=square -flat=../masters/pp_flat_stacked -framing=max
 
 # Stack calibrated lights to result.fit
