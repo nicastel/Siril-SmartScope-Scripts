@@ -29,11 +29,8 @@ cd biases
 convert bias -out=../process
 cd ../process
 
-#cut the left part
-seqcrop bias 7 0 1296 976
-
 # Stack Bias Frames to bias_stacked.fit
-stack cropped_bias rej 3 3 -nonorm -out=../masters/bias_stacked
+stack bias rej 3 3 -nonorm -out=../masters/bias_stacked
 cd ..
 
 # Convert Flat Frames to .fit files
@@ -41,14 +38,11 @@ cd flats
 convert flat -out=../process
 cd ../process
 
-#cut the left part
-seqcrop flat 7 0 1296 976
-
 # Calibrate Flat Frames
-calibrate cropped_flat -bias=../masters/bias_stacked
+calibrate flat -bias=../masters/bias_stacked
 
 # Stack Flat Frames to pp_flat_stacked.fit
-stack pp_cropped_flat rej 3 3 -norm=mul -out=../masters/pp_flat_stacked
+stack pp_flat rej 3 3 -norm=mul -out=../masters/pp_flat_stacked
 cd ..
 
 # Convert Dark Frames to .fit files
@@ -56,11 +50,8 @@ cd darks
 convert dark -out=../process
 cd ../process
 
-#cut the left part
-seqcrop dark 7 0 1296 976
-
 # Stack Dark Frames to dark_stacked.fit
-stack cropped_dark rej 3 3 -nonorm -out=../masters/dark_stacked
+stack dark rej 3 3 -nonorm -out=../masters/dark_stacked
 cd ..
 
 # Convert Light Frames to .fit files
@@ -68,28 +59,22 @@ cd lights
 convert light -out=../process
 cd ../process
 
-#cut the left part
-seqcrop light 7 0 1296 976
-
 # Calibrate Light Frames
-calibrate cropped_light -dark=../masters/dark_stacked -flat=../masters/pp_flat_stacked -cc=dark -cfa -equalize_cfa
-
-# Extract linear gradient
-seqsubsky pp_cropped_light 1
+calibrate light -dark=../masters/dark_stacked -flat=../masters/pp_flat_stacked -cc=dark -cfa -equalize_cfa
 
 # Align lights with Drizzle
-register bkg_pp_cropped_light -2pass -drizzle -scale=2.0 -pixfrac=0.5 -kernel=square -flat=../masters/pp_flat_stacked
-seqapplyreg bkg_pp_cropped_light -drizzle -scale=2.0 -pixfrac=0.5 -kernel=square -flat=../masters/pp_flat_stacked -framing=max
+register pp_light -2pass -drizzle -scale=2.0 -pixfrac=0.5 -kernel=square -flat=../masters/pp_flat_stacked
+seqapplyreg pp_light -drizzle -scale=2.0 -pixfrac=0.5 -kernel=square -flat=../masters/pp_flat_stacked -framing=max
 
 # Stack calibrated lights to result.fit
-stack r_bkg_pp_cropped_light rej 3 3 -norm=addscale -output_norm -rgb_equal -filter-wfwhm=90% -out=result
+stack r_pp_light rej 3 3 -norm=addscale -output_norm -rgb_equal -filter-wfwhm=90% -out=result
 
 setcompress 0
 
 # and flipping if required
 load result
 mirrorx -bottomup
-save ../result/siril_result_drizzle_bge_$LIVETIME:%d$s
+save ../result/siril_result_drizzle2x_$LIVETIME:%d$s
 
 cd ..
 close
