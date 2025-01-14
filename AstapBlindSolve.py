@@ -2,7 +2,7 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Project: Simple python siril script to run CosmicClarity Sharpen
+# Project: Simple python siril script to blind solve using astap_cli
 #
 # ------------------------------------------------------------------------------
 #    Author:  Nicolas CASTEL <nic.castel (at) gmail.com>
@@ -41,6 +41,9 @@ try:
     print(os.popen(CMD).read())
     
     siril.cmd("load",  FILE + "wcs.fit")
+    
+    #annotate using astrometry information
+    siril.cmd("conesearch")
     
 except Exception as e :
     print("\n**** ERROR *** " +  str(e) + "\n" )    
