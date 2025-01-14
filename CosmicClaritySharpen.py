@@ -16,14 +16,21 @@
 
 import sys
 import os
+import sys
 from siril.connection import SirilInterface
 
-
 # SET THIS PATH ! :
-PATH = "/Users/nicolas.castel/Documents/Dev/CosmicClaritySuite_macos/"
+PATH = "/Users/nicolas.castel/Documents/Dev/CosmicClaritySuite_macos"
 
-EXE = "SetiAstroCosmicClaritymac"
-    
+# default is linux
+EXE = "SetiAstroCosmicClarity"
+if sys.platform == "darwin":
+    # MAC OS X
+    EXE = "SetiAstroCosmicClarityMac"
+elif os.name == "nt":
+    # Windows, Cygwin, etc. (either 32-bit or 64-bit)
+    EXE = "setiastrocosmicclarity.exe"
+
 print("CosmicClarity:begin") 
 siril = SirilInterface()
 
@@ -34,14 +41,14 @@ try:
     
     FILE = os.path.basename(siril.get_image_filename())
     
-    siril.cmd("savetif", PATH + "input/" + FILE , "-astro")
+    siril.cmd("savetif", os.path.join(PATH, "input", FILE) , "-astro")
     
-    print(os.popen(PATH + EXE).read())
+    print(os.popen(os.path.join(PATH,EXE)).read())
     
-    siril.cmd("load", PATH + "output/" + FILE + "_sharpened.tif")
+    siril.cmd("load",  os.path.join(PATH, "output", FILE + "_sharpened.tif"))
     
-    os.remove( PATH + "input/" + FILE + ".tif")
-    os.remove( PATH + "output/" + FILE + "_sharpened.tif")
+    os.remove(os.path.join(PATH, "input", FILE + ".tif"))
+    os.remove(os.path.join(PATH, "output", FILE + "_sharpened.tif"))
     
 except Exception as e :
     print("\n**** ERROR *** " +  str(e) + "\n" )    
