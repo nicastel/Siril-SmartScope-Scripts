@@ -17,7 +17,7 @@
 import sys
 import os
 import sys
-from siril.connection import SirilInterface
+from sirilpy.connection import SirilInterface
 
 # SET THIS PATH ! :
 PATH = "/Users/nicolas.castel/Documents/Dev/CosmicClaritySuite_macos"

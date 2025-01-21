@@ -16,7 +16,7 @@
 
 import sys
 import os
-from siril.connection import SirilInterface
+from sirilpy.connection import SirilInterface
 
 
 # SET THIS PATH ! :
