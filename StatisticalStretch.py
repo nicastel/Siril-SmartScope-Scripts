@@ -17,7 +17,6 @@
 
 import sys
 import os
-import sys
 from sirilpy.connection import SirilInterface
 import numpy as np
 
@@ -82,15 +81,19 @@ try:
 
     if siril.claim_thread() :
         siril.undo_save_state("StatisticalStrech")
-        image = siril.get_image_pixeldata()
-        stretched = stretch_color_image(image, 0.25)
+        image = siril.get_image()
+        if image.naxis == 2 :
+            stretched = stretch_mono_image(image.data, 0.25)
+        else :
+            stretched = stretch_color_image(image.data, 0.25)
         siril.set_image_pixeldata(stretched)
-        siril.release_thread()
     else :
         print("StatisticalStrech aborted, a siril processing is ongoing, end it and retry")
 
 except Exception as e :
     print("\n**** ERROR *** " +  str(e) + "\n" )
+finally:
+   siril.release_thread()
 
 siril.disconnect()
 del siril
