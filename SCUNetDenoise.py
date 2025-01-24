@@ -39,7 +39,7 @@ def get_device() -> torch.device:
         print("cuda acceleration used")
         return torch.device("cuda")
     if os.name == 'nt':
-        s.ensure_installed("torch_directml")
+        s.ensure_installed("torch-directml")
         import torch_directml
         print("directml acceleration used")
         return torch_directml.default_device()
