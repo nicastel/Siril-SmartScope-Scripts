@@ -3,7 +3,7 @@
 
 # ------------------------------------------------------------------------------
 # Project: Python siril script to run SCUNet denoiser via spandrel
-# based on https://github.com/setiastro/setiastrosuite code
+# using model from https://github.com/cszn/SCUNet
 #
 # ------------------------------------------------------------------------------
 #    Author:  Nicolas CASTEL <nic.castel (at) gmail.com>
@@ -35,12 +35,20 @@ from spandrel import ImageModelDescriptor, ModelLoader
 
 # suppported for SCUNet : Nvidia GPU / Apple MPS / DirectML on Windows / CPU
 def get_device() -> torch.device:
+    if torch.cuda.is_available():
+        print("cuda acceleration used")
+        return torch.device("cuda")
     if os.name == 'nt':
         s.ensure_installed("torch_directml")
         import torch_directml
+        print("directml acceleration used")
         return torch_directml.default_device()
+    if torch.backends.mps.is_available() :
+        print("mps acceleration used")
+        return torch.device("mps")
     else:
-        return torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+        print("cpu used")
+        return torch.device("cpu")
 
 def image_to_tensor(img: np.ndarray) -> torch.Tensor:
     img = img.astype(np.float32) / 255.0
@@ -159,6 +167,8 @@ try:
         ssl._create_default_https_context = ssl._create_stdlib_context
         urllib.request.urlretrieve("https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth", modelpath)
         print("SCUnet model downloaded : "+modelpath)
+        
+    device = get_device()
     
     # load a model from disk
     model = ModelLoader().load_from_file(r""+modelpath)
