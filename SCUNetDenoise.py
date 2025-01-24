@@ -83,24 +83,33 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
         data = np.clip(data, 0, 255)
 
         batch, channel, height, width = data.shape
+        print("height :"+str(height)+" width :"+str(width))
 
         tiles_x = width // tile_size
         tiles_y = height // tile_size
 
-        for i in range(tiles_y * tiles_x):
+        for i in range(tiles_x * tiles_y):
             x = i % tiles_y
             y = math.floor(i/tiles_y)
+            
+            print("tile x :"+str(x)+" y :"+str(y))
 
-            input_start_x = x * tile_size
-            input_start_y = y * tile_size
+            input_start_x = y * tile_size
+            input_start_y = x * tile_size
 
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
+            
+            print("input_start_x :"+str(input_start_x)+" input_end_x :"+str(input_end_x))
+            print("input_start_y :"+str(input_start_y)+" input_end_y :"+str(input_end_y))
 
             input_start_x_pad = max(input_start_x - tile_pad, 0)
             input_end_x_pad = min(input_end_x + tile_pad, width)
             input_start_y_pad = max(input_start_y - tile_pad, 0)
             input_end_y_pad = min(input_end_y + tile_pad, height)
+            
+            print("input_start_x_pad :"+str(input_start_x_pad)+" input_end_x_pad :"+str(input_end_x_pad))
+            print("input_start_y_pad :"+str(input_start_y_pad)+" input_end_y_pad :"+str(input_end_y_pad))
 
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
@@ -111,16 +120,19 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
             progress = (i+1) / (tiles_y * tiles_x)
 
             output_start_x_tile = (input_start_x - input_start_x_pad) * scale
-            output_end_x_tile = output_start_x_tile + input_tile_width * scale
+            output_end_x_tile = output_start_x_tile + (input_tile_width * scale)
             output_start_y_tile = (input_start_y - input_start_y_pad) * scale
-            output_end_y_tile = output_start_y_tile + input_tile_height * scale
+            output_end_y_tile = output_start_y_tile + (input_tile_height * scale)
+            
+            print("output_start_x_tile :"+str(output_start_x_tile)+" output_end_x_tile :"+str(output_end_x_tile))
+            print("output_start_y_tile :"+str(output_start_y_tile)+" output_end_y_tile :"+str(output_end_y_tile))         
 
             output_tile = output_tile[:, :, output_start_y_tile:output_end_y_tile, output_start_x_tile:output_end_x_tile]
 
             output_tile = (np.rollaxis(output_tile.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 255).astype(np.uint8)
 
             if yield_extra_details:
-                yield (output_tile, input_start_x, input_start_y, input_tile_width, input_tile_height, progress)
+                yield (output_tile, input_start_y, input_start_x, input_tile_width, input_tile_height, progress)
             else:
                 yield output_tile
 
@@ -137,6 +149,7 @@ temp_filename = None
 
 try:
     siril.connect()
+    siril.reset_progress()
     
     modelpath = os.path.join(siril.get_siril_configdir(),"scunet_color_real_psnr.pth")
     
@@ -154,6 +167,8 @@ try:
     
     model.eval()
     
+    siril.update_progress("SCUNet model initialised",0.05)
+    
     # Create a temporary file
     with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as temp_file:
         temp_filename = temp_file.name
@@ -166,12 +181,14 @@ try:
     # read image out send it to the GPU
     imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_COLOR)
     original_height, original_width, channels = imagecv2in.shape
+    
+    print("original_height :"+str(original_height)+" original_width :"+str(original_width))
 
     tile_size = 1024
     scale = 1
 
     # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
-    imgcv2resized = cv2.resize(imagecv2in,(max(original_width//tile_size * tile_size, tile_size),max(original_height//tile_size * tile_size, tile_size)),interpolation=cv2.INTER_CUBIC)
+    imgcv2resized = cv2.resize(imagecv2in,(original_width//tile_size * tile_size + tile_size,original_height//tile_size * tile_size + tile_size),interpolation=cv2.INTER_CUBIC)
 
     # Allocate an image to save the tiles
     imgresult = cv2.copyMakeBorder(imgcv2resized,0,0,0,0,cv2.BORDER_REPLICATE)
@@ -183,13 +200,17 @@ try:
 
         tile_data, x, y, w, h, p = tile
         if w != 0 and h != 0 :
-            imgresult[x*scale:x*scale+tile_size,y*scale:y*scale+tile_size] = tile_data
+            imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
+            
+        siril.update_progress("Image denoising ongoing",p)
 
     # Resize back to the expected size
     imagecv2out = cv2.resize(imgresult,(original_width*scale,original_height*scale),interpolation=cv2.INTER_CUBIC)
 
     # write the image to the disk
     cv2.imwrite(temp_filename, imagecv2out)
+    
+    siril.update_progress("Image denoised",1.0)
     
     # Load back into Siril
     siril.cmd("load", temp_filename)
