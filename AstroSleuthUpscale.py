@@ -2,8 +2,8 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Project: Python siril script to run SCUNet denoiser via spandrel
-# using model from https://github.com/cszn/SCUNet
+# Project: Python siril script to run AstroSleuth Upscaler via spandrel
+# using model from https://github.com/Aveygo/AstroSleuth
 #
 # ------------------------------------------------------------------------------
 #    Author:  Nicolas CASTEL <nic.castel (at) gmail.com>
@@ -321,7 +321,7 @@ class SirilAstroSleuth:
                 if w != 0 and h != 0 :
                     imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
                     
-                self.siril.update_progress("Image upscale complete",p)
+                self.siril.update_progress("Image upscale ongoing",p)
 
             # Resize back to the expected size
             imagecv2out = cv2.resize(imgresult,(original_width*scale,original_height*scale),interpolation=cv2.INTER_CUBIC)
@@ -344,9 +344,9 @@ class SirilAstroSleuth:
             if temp_filename and os.path.exists(temp_filename):
                 try:
                    os.remove(temp_filename)
-                   siril.log(f"Temporary file deleted: {temp_filename}")
+                   self.siril.log(f"Temporary file deleted: {temp_filename}")
                 except OSError as e:
-                   siril.log(f"Failed to delete temporary file: {str(e)}")
+                   self.siril.log(f"Failed to delete temporary file: {str(e)}")
             # Release the thread in the finally: block so that it is guaranteed to be released
             self.siril.release_thread()
 
