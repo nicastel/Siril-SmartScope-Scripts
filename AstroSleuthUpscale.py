@@ -17,12 +17,19 @@
 
 import sys
 import os
+import asyncio
 import sirilpy as s
 import numpy as np
 import urllib.request 
 import ssl
 import tempfile
 import math
+
+s.ensure_installed("ttkthemes")
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from ttkthemes import ThemedTk
+from sirilpy import tksiril
 
 s.ensure_installed("torch")
 import torch
@@ -32,6 +39,19 @@ import cv2
 
 s.ensure_installed("spandrel")
 from spandrel import ImageModelDescriptor, ModelLoader
+
+VERSION = "1.0.0"
+
+# Set image warning and max sizes
+WARNING_SIZE = 4096
+MAX_SIZE = None
+#Image.MAX_IMAGE_PIXELS = 8192
+
+# list of models
+models = [["AstroSleuthV1","https://github.com/Aveygo/AstroSleuth/releases/download/v1/AstroSleuthV1.pth"],
+    ["AstroSleuthV2","https://github.com/Aveygo/AstroSleuth/releases/download/v2/AstroSleuthV2.pth"], 
+    ["AstroSleuthFAST","https://github.com/Aveygo/AstroSleuth/releases/download/v3/AstroSleuthFAST.pth"],  
+    ["AstroSleuthNEXT","https://github.com/Aveygo/AstroSleuth/releases/download/v4/AstroSleuthNEXT.pth"]]
 
 # suppported for SCUNet : Nvidia GPU / Apple MPS / DirectML on Windows / CPU
 def get_device() -> torch.device:
@@ -146,97 +166,199 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
 
         yield None
 
-# Set image warning and max sizes
-WARNING_SIZE = 4096
-MAX_SIZE = None
-#Image.MAX_IMAGE_PIXELS = 8192
+class SirilAstroSleuth:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"AstroSleuth Upscale - v{VERSION}")
+        self.root.resizable(False, False)
 
-print("AstroSleuthUpscale:begin")
-siril = s.SirilInterface()
-temp_filename = None
+        self.style = tksiril.standard_style()
 
-try:
-    siril.connect()
-    siril.reset_progress()
-    
-    modelpath = os.path.join(siril.get_siril_configdir(),"AstroSleuthV1.pth")
-    
-    if os.path.isfile(modelpath) :
-        print("AstroSleuth model found : "+modelpath) 
-    else :
-        ssl._create_default_https_context = ssl._create_stdlib_context
-        urllib.request.urlretrieve("https://github.com/Aveygo/AstroSleuth/releases/download/v1/AstroSleuthV1.pth", modelpath)
-        print("AstroSleuth model downloaded : "+modelpath)
+        # Initialize Siril connection
+        self.siril = s.SirilInterface()
+
+        if not self.siril.connect():
+            self.siril.error_messagebox("Failed to connect to Siril")
+            self.close_dialog()
+            return
+
+        if not self.siril.is_image_loaded():
+            self.siril.error_messagebox("No image loaded")
+            self.close_dialog()
+            return
+
+        if not self.siril.cmd("requires", "1.3.6"):
+            self.close_dialog()
+            return
+
+        if not self.siril.cmd("requires", "1.3.6"):
+            messagebox.showerror("Error", "Siril version requirement not met")
+            self.close_dialog()
+            return
+
+        tksiril.match_theme_to_siril(self.root, self.siril)
+
+        # Create widgets
+        self.create_widgets()
         
-    device = get_device()
-    
-    # load a model from disk
-    model = ModelLoader().load_from_file(r""+modelpath)
-    # make sure it's an image to image model
-    assert isinstance(model, ImageModelDescriptor)
-    
-    model.eval()
-    
-    siril.update_progress("AstroSleuth model initialised",0.05)
-    
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as temp_file:
-        temp_filename = temp_file.name
-        siril.log(f"Temporary file created: {temp_filename}")
-
-    # Save current file
-    siril.cmd("savetif", os.path.splitext(temp_filename)[0], " -astro")
-    siril.log(f"FITS file saved: {temp_filename}")
+    def create_widgets(self):
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
         
-    # read image out send it to the GPU
-    imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_COLOR)
-    original_height, original_width, channels = imagecv2in.shape
-    
-    print("original_height :"+str(original_height)+" original_width :"+str(original_width))
+        # Title
+        title_label = ttk.Label(
+            main_frame,
+            text="AstroSleuth Upscale Settings",
+            style="Header.TLabel"
+        )
+        title_label.pack(pady=(0, 20))
+        
+        # Model Selection Frame
+        model_frame = ttk.LabelFrame(main_frame, text="Model selection", padding=10)
+        model_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    tile_size = 256
-    scale = 4
+        self.model_var = tk.StringVar(value="https://github.com/Aveygo/AstroSleuth/releases/download/v1/AstroSleuthV1.pth")
+        for model in models:
+            ttk.Radiobutton(
+                model_frame,
+                text=model[0],
+                variable=self.model_var,
+                value=model[1]
+            ).pack(anchor=tk.W, pady=2)
 
-    # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
-    imgcv2resized = cv2.resize(imagecv2in,(original_width//tile_size * tile_size + tile_size,original_height//tile_size * tile_size + tile_size),interpolation=cv2.INTER_CUBIC)
+        # Action Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=10)
 
-    # Allocate an image to save the tiles
-    imgresult = cv2.resize(imgcv2resized,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
- 
-    for i, tile in enumerate(tile_process(model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
+        close_btn = ttk.Button(
+            button_frame,
+            text="Close",
+            command=self.close_dialog,
+            style="TButton"
+        )
+        close_btn.pack(side=tk.LEFT, padx=5)
 
-        if tile is None:
-            break
+        apply_btn = ttk.Button(
+            button_frame,
+            text="Apply",
+            command=self._on_apply,
+            style="TButton"
+        )
+        apply_btn.pack(side=tk.LEFT, padx=5)
 
-        tile_data, x, y, w, h, p = tile
-        if w != 0 and h != 0 :
-            imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
-            
-        siril.update_progress("Image upscale complete",p)
+    def _on_apply(self):
+        # Wrap the async method to run in the event loop
+        self.root.after(0, self._run_async_task)
 
-    # Resize back to the expected size
-    imagecv2out = cv2.resize(imgresult,(original_width*scale,original_height*scale),interpolation=cv2.INTER_CUBIC)
+    def _run_async_task(self):
+        asyncio.run(self._apply_changes())
 
-    # write the image to the disk
-    cv2.imwrite(temp_filename, imagecv2out)
-    
-    siril.update_progress("Image upscaled",1.0)
-    
-    # Load back into Siril
-    siril.cmd("load", temp_filename)
-    siril.log(f"FITS file loaded: {temp_filename}")
+    def close_dialog(self):
+        self.siril.disconnect()
+        self.root.quit()
+        self.root.destroy()
 
-except Exception as e :
-    print("\n**** ERROR *** " +  str(e) + "\n" )
-finally:
-    # Clean up: delete the temporary file
-    if temp_filename and os.path.exists(temp_filename):
+    async def _apply_changes(self):
+        temp_filename = None
         try:
-           os.remove(temp_filename)
-           siril.log(f"Temporary file deleted: {temp_filename}")
-        except OSError as e:
-           siril.log(f"Failed to delete temporary file: {str(e)}")
+             # Read user input values
+            model = self.model_var.get()
+            print (model)
+            
+            self.siril.reset_progress()
 
-siril.disconnect()
-del siril
-print("AstroSleuthUpscale:end")
+            modelpath = os.path.join(self.siril.get_siril_configdir(),os.path.basename(model))
+    
+            if os.path.isfile(modelpath) :
+                print("model found : "+modelpath) 
+            else :
+                ssl._create_default_https_context = ssl._create_stdlib_context
+                urllib.request.urlretrieve(model, modelpath)
+                print("model downloaded : "+modelpath)
+                
+            device = get_device()
+            
+            # load a model from disk
+            model = ModelLoader().load_from_file(r""+modelpath)
+            # make sure it's an image to image model
+            assert isinstance(model, ImageModelDescriptor)
+            
+            model.eval()
+            
+            self.siril.update_progress("model initialised",0.05)
+            
+            # Create a temporary file
+            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as temp_file:
+                temp_filename = temp_file.name
+                self.siril.log(f"Temporary file created: {temp_filename}")
+
+            # Save current file
+            self.siril.cmd("savetif", os.path.splitext(temp_filename)[0], " -astro")
+            self.siril.log(f"FITS file saved: {temp_filename}")
+                
+            # read image out send it to the GPU
+            imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_COLOR)
+            original_height, original_width, channels = imagecv2in.shape
+            
+            print("original_height :"+str(original_height)+" original_width :"+str(original_width))
+
+            tile_size = 256
+            scale = 4
+
+            # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
+            imgcv2resized = cv2.resize(imagecv2in,(original_width//tile_size * tile_size + tile_size,original_height//tile_size * tile_size + tile_size),interpolation=cv2.INTER_CUBIC)
+
+            # Allocate an image to save the tiles
+            imgresult = cv2.resize(imgcv2resized,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
+         
+            for i, tile in enumerate(tile_process(model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
+
+                if tile is None:
+                    break
+
+                tile_data, x, y, w, h, p = tile
+                if w != 0 and h != 0 :
+                    imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
+                    
+                self.siril.update_progress("Image upscale complete",p)
+
+            # Resize back to the expected size
+            imagecv2out = cv2.resize(imgresult,(original_width*scale,original_height*scale),interpolation=cv2.INTER_CUBIC)
+
+            # write the image to the disk
+            cv2.imwrite(temp_filename, imagecv2out)
+            
+            self.siril.update_progress("Image upscaled",1.0)
+            
+            # Load back into Siril
+            self.siril.cmd("load", temp_filename)
+            self.siril.log(f"FITS file loaded: {temp_filename}")
+            self.siril.log("AstroSleuth Upscale complete.")
+
+        except Exception as e:
+            print(f"Error in apply_changes: {str(e)}")
+            self.siril.update_progress(f"Error: {str(e)}", 0)
+        finally:
+            # Clean up: delete the temporary file
+            if temp_filename and os.path.exists(temp_filename):
+                try:
+                   os.remove(temp_filename)
+                   siril.log(f"Temporary file deleted: {temp_filename}")
+                except OSError as e:
+                   siril.log(f"Failed to delete temporary file: {str(e)}")
+            # Release the thread in the finally: block so that it is guaranteed to be released
+            self.siril.release_thread()
+
+def main():
+    try:
+        root = ThemedTk()
+        app = SirilAstroSleuth(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Error initializing application: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+
