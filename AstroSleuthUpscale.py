@@ -194,15 +194,15 @@ try:
     
     print("original_height :"+str(original_height)+" original_width :"+str(original_width))
 
-    tile_size = 1024
-    scale = 2
+    tile_size = 256
+    scale = 4
 
     # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
     imgcv2resized = cv2.resize(imagecv2in,(original_width//tile_size * tile_size + tile_size,original_height//tile_size * tile_size + tile_size),interpolation=cv2.INTER_CUBIC)
 
     # Allocate an image to save the tiles
-    imgresult = cv2.resize(imgcv2resized,((original_width//tile_size * tile_size + tile_size)*scale,(original_height//tile_size * tile_size + tile_size)*scale),interpolation=cv2.INTER_CUBIC)
-    
+    imgresult = cv2.resize(imgcv2resized,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
+ 
     for i, tile in enumerate(tile_process(model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
 
         if tile is None:
