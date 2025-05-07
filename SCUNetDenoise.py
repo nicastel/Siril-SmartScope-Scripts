@@ -70,7 +70,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         feed them one by one into the model, then yield the resulting output tiles.
         """
 
-        tile_pad=432
+        tile_pad=144
 
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
@@ -181,7 +181,7 @@ try:
 
     print("original_height :"+str(original_height)+" original_width :"+str(original_width))
 
-    tile_size = 1024
+    tile_size = 512
     scale = 1
 
     # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
