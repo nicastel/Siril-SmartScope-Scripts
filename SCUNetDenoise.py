@@ -70,7 +70,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         feed them one by one into the model, then yield the resulting output tiles.
         """
 
-        tile_pad=16
+        tile_pad=432
 
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
