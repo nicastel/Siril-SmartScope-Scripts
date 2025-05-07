@@ -56,7 +56,7 @@ def image_to_tensor(device: torch.device, img: np.ndarray) -> torch.Tensor:
 
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
-    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0)).astype(np.uint16)
+    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 65535).astype(np.uint16)
 
 def image_inference_tensor(
     model: ImageModelDescriptor, tensor: torch.Tensor
@@ -75,6 +75,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
         data = np.expand_dims(data, axis=0)
+        data = np.clip(data, 0, 65535)
 
         batch, channel, height, width = data.shape
         print("height :"+str(height)+" width :"+str(width))
@@ -108,7 +109,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
 
-            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32)
+            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32) / 65535
 
             output_tile = image_inference_tensor(model,image_to_tensor(device, input_tile))
             progress = (i+1) / (tiles_y * tiles_x)
@@ -175,7 +176,7 @@ try:
     siril.log(f"FITS file saved: {temp_filename}")
 
     # read image out send it to the GPU
-    imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_COLOR)
+    imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_UNCHANGED)
     original_height, original_width, channels = imagecv2in.shape
 
     print("original_height :"+str(original_height)+" original_width :"+str(original_width))
