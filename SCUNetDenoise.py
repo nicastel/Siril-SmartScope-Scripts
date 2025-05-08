@@ -38,11 +38,6 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         print("cuda acceleration used")
         return torch.device("cuda")
-    if os.name == 'nt':
-        s.ensure_installed("torch-directml")
-        import torch_directml
-        print("directml acceleration used")
-        return torch_directml.default_device()
     if torch.backends.mps.is_available() :
         print("mps acceleration used")
         return torch.device("mps")
@@ -158,11 +153,9 @@ try:
     device = get_device()
 
     # load a model from disk
-    model = ModelLoader().load_from_file(r""+modelpath).to(device)
+    model = ModelLoader().load_from_file(r""+modelpath).eval().to(device)
     # make sure it's an image to image model
     assert isinstance(model, ImageModelDescriptor)
-
-    model.eval()
 
     siril.update_progress("SCUNet model initialised",0.05)
 
