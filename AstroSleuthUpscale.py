@@ -20,7 +20,7 @@ import os
 import asyncio
 import sirilpy as s
 import numpy as np
-import urllib.request 
+import urllib.request
 import ssl
 import tempfile
 import math
@@ -49,8 +49,8 @@ MAX_SIZE = None
 
 # list of models
 models = [["AstroSleuthV1","https://github.com/Aveygo/AstroSleuth/releases/download/v1/AstroSleuthV1.pth"],
-    ["AstroSleuthV2","https://github.com/Aveygo/AstroSleuth/releases/download/v2/AstroSleuthV2.pth"], 
-    ["AstroSleuthFAST","https://github.com/Aveygo/AstroSleuth/releases/download/v3/AstroSleuthFAST.pth"],  
+    ["AstroSleuthV2","https://github.com/Aveygo/AstroSleuth/releases/download/v2/AstroSleuthV2.pth"],
+    ["AstroSleuthFAST","https://github.com/Aveygo/AstroSleuth/releases/download/v3/AstroSleuthFAST.pth"],
     ["AstroSleuthNEXT","https://github.com/Aveygo/AstroSleuth/releases/download/v4/AstroSleuthNEXT.pth"]]
 
 # suppported for SCUNet : Nvidia GPU / Apple MPS / DirectML on Windows / CPU
@@ -58,11 +58,6 @@ def get_device() -> torch.device:
     if torch.cuda.is_available():
         print("cuda acceleration used")
         return torch.device("cuda")
-    if os.name == 'nt':
-        s.ensure_installed("torch-directml")
-        import torch_directml
-        print("directml acceleration used")
-        return torch_directml.default_device()
     if torch.backends.mps.is_available() :
         print("mps acceleration used")
         return torch.device("mps")
@@ -70,34 +65,20 @@ def get_device() -> torch.device:
         print("cpu used")
         return torch.device("cpu")
 
-def image_to_tensor(img: np.ndarray) -> torch.Tensor:
-    img = img.astype(np.float32) / 255.0
-    if img.ndim == 2:
-        img = np.expand_dims(img, axis=2)
-    if img.shape[2] == 1:
-        pass
-    else:
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = np.transpose(img, (2, 0, 1))
+def image_to_tensor(device: torch.device, img: np.ndarray) -> torch.Tensor:
     tensor = torch.from_numpy(img)
-    return tensor.unsqueeze(0)
-
+    return tensor.to(device)
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
-    image = tensor.cpu().squeeze().numpy()
-    image = np.transpose(image, (1, 2, 0))
-    image = np.clip((image * 255.0).round(), 0, 255)
-    image = image.astype(np.uint8)
-    image = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
-    return image
+    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 65535).astype(np.uint16)
 
 def image_inference_tensor(
     model: ImageModelDescriptor, tensor: torch.Tensor
 ) -> torch.Tensor:
     with torch.no_grad():
         return model(tensor)
-        
-def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size, yield_extra_details=False):
+
+def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.ndarray, scale, tile_size, yield_extra_details=False):
         """
         Process data [height, width, channel] into tiles of size [tile_size, tile_size, channel],
         feed them one by one into the model, then yield the resulting output tiles.
@@ -108,7 +89,7 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
         data = np.expand_dims(data, axis=0)
-        data = np.clip(data, 0, 255)
+        data = np.clip(data, 0, 65535)
 
         batch, channel, height, width = data.shape
         print("height :"+str(height)+" width :"+str(width))
@@ -119,7 +100,7 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
         for i in range(tiles_x * tiles_y):
             x = i % tiles_y
             y = math.floor(i/tiles_y)
-            
+
             print("tile x :"+str(x)+" y :"+str(y))
 
             input_start_x = y * tile_size
@@ -127,7 +108,7 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
 
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
-            
+
             print("input_start_x :"+str(input_start_x)+" input_end_x :"+str(input_end_x))
             print("input_start_y :"+str(input_start_y)+" input_end_y :"+str(input_end_y))
 
@@ -135,29 +116,29 @@ def tile_process(model: ImageModelDescriptor, data: np.ndarray, scale, tile_size
             input_end_x_pad = min(input_end_x + tile_pad, width)
             input_start_y_pad = max(input_start_y - tile_pad, 0)
             input_end_y_pad = min(input_end_y + tile_pad, height)
-            
+
             print("input_start_x_pad :"+str(input_start_x_pad)+" input_end_x_pad :"+str(input_end_x_pad))
             print("input_start_y_pad :"+str(input_start_y_pad)+" input_end_y_pad :"+str(input_end_y_pad))
 
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
 
-            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32) / 255
+            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32) / 65535
 
-            output_tile = image_inference_tensor(model,torch.from_numpy(input_tile))
+            output_tile = image_inference_tensor(model,image_to_tensor(device, input_tile))
             progress = (i+1) / (tiles_y * tiles_x)
 
             output_start_x_tile = (input_start_x - input_start_x_pad) * scale
             output_end_x_tile = output_start_x_tile + (input_tile_width * scale)
             output_start_y_tile = (input_start_y - input_start_y_pad) * scale
             output_end_y_tile = output_start_y_tile + (input_tile_height * scale)
-            
+
             print("output_start_x_tile :"+str(output_start_x_tile)+" output_end_x_tile :"+str(output_end_x_tile))
-            print("output_start_y_tile :"+str(output_start_y_tile)+" output_end_y_tile :"+str(output_end_y_tile))         
+            print("output_start_y_tile :"+str(output_start_y_tile)+" output_end_y_tile :"+str(output_end_y_tile))
 
             output_tile = output_tile[:, :, output_start_y_tile:output_end_y_tile, output_start_x_tile:output_end_x_tile]
 
-            output_tile = (np.rollaxis(output_tile.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 255).astype(np.uint8)
+            output_tile = tensor_to_image(output_tile)
 
             if yield_extra_details:
                 yield (output_tile, input_start_y, input_start_x, input_tile_width, input_tile_height, progress)
@@ -187,12 +168,9 @@ class SirilAstroSleuth:
             self.close_dialog()
             return
 
-        if not self.siril.cmd("requires", "1.3.6"):
-            self.close_dialog()
-            return
-
-        if not self.siril.cmd("requires", "1.3.6"):
-            messagebox.showerror("Error", "Siril version requirement not met")
+        try:
+            self.siril.cmd("requires", "1.3.6")
+        except s.CommandError:
             self.close_dialog()
             return
 
@@ -200,12 +178,12 @@ class SirilAstroSleuth:
 
         # Create widgets
         self.create_widgets()
-        
+
     def create_widgets(self):
         # Main frame
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
-        
+
         # Title
         title_label = ttk.Label(
             main_frame,
@@ -213,7 +191,7 @@ class SirilAstroSleuth:
             style="Header.TLabel"
         )
         title_label.pack(pady=(0, 20))
-        
+
         # Model Selection Frame
         model_frame = ttk.LabelFrame(main_frame, text="Model selection", padding=10)
         model_frame.pack(fill=tk.X, padx=5, pady=5)
@@ -265,29 +243,27 @@ class SirilAstroSleuth:
              # Read user input values
             model = self.model_var.get()
             print (model)
-            
+
             self.siril.reset_progress()
 
             modelpath = os.path.join(self.siril.get_siril_configdir(),os.path.basename(model))
-    
+
             if os.path.isfile(modelpath) :
-                print("model found : "+modelpath) 
+                print("model found : "+modelpath)
             else :
                 ssl._create_default_https_context = ssl._create_stdlib_context
                 urllib.request.urlretrieve(model, modelpath)
                 print("model downloaded : "+modelpath)
-                
+
             device = get_device()
-            
+
             # load a model from disk
-            model = ModelLoader().load_from_file(r""+modelpath)
+            model = ModelLoader().load_from_file(r""+modelpath).eval().to(device)
             # make sure it's an image to image model
             assert isinstance(model, ImageModelDescriptor)
-            
-            model.eval()
-            
+
             self.siril.update_progress("model initialised",0.05)
-            
+
             # Create a temporary file
             with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as temp_file:
                 temp_filename = temp_file.name
@@ -296,11 +272,11 @@ class SirilAstroSleuth:
             # Save current file
             self.siril.cmd("savetif", os.path.splitext(temp_filename)[0], " -astro")
             self.siril.log(f"FITS file saved: {temp_filename}")
-                
+
             # read image out send it to the GPU
-            imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_COLOR)
+            imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_UNCHANGED)
             original_height, original_width, channels = imagecv2in.shape
-            
+
             print("original_height :"+str(original_height)+" original_width :"+str(original_width))
 
             tile_size = 256
@@ -311,8 +287,8 @@ class SirilAstroSleuth:
 
             # Allocate an image to save the tiles
             imgresult = cv2.resize(imgcv2resized,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
-         
-            for i, tile in enumerate(tile_process(model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
+
+            for i, tile in enumerate(tile_process(device, model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
 
                 if tile is None:
                     break
@@ -320,7 +296,7 @@ class SirilAstroSleuth:
                 tile_data, x, y, w, h, p = tile
                 if w != 0 and h != 0 :
                     imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
-                    
+
                 self.siril.update_progress("Image upscale ongoing",p)
 
             # Resize back to the expected size
@@ -328,9 +304,9 @@ class SirilAstroSleuth:
 
             # write the image to the disk
             cv2.imwrite(temp_filename, imagecv2out)
-            
+
             self.siril.update_progress("Image upscaled",1.0)
-            
+
             # Load back into Siril
             self.siril.cmd("load", temp_filename)
             self.siril.log(f"FITS file loaded: {temp_filename}")
@@ -347,8 +323,6 @@ class SirilAstroSleuth:
                    self.siril.log(f"Temporary file deleted: {temp_filename}")
                 except OSError as e:
                    self.siril.log(f"Failed to delete temporary file: {str(e)}")
-            # Release the thread in the finally: block so that it is guaranteed to be released
-            self.siril.release_thread()
 
 def main():
     try:
@@ -361,4 +335,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
