@@ -78,13 +78,13 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         tiles_y = height // tile_size
 
         for i in range(tiles_x * tiles_y):
-            x = i % tiles_y
-            y = math.floor(i/tiles_y)
+            x = math.floor(i/tiles_y)
+            y = i % tiles_y
 
             print("tile x :"+str(x)+" y :"+str(y))
 
-            input_start_x = y * tile_size
-            input_start_y = x * tile_size
+            input_start_x = x * tile_size
+            input_start_y = y * tile_size
 
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
