@@ -49,7 +49,6 @@ def image_to_tensor(device: torch.device, img: np.ndarray) -> torch.Tensor:
     tensor = torch.from_numpy(img)
     return tensor.to(device)
 
-
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
     return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 65535).astype(np.uint16)
 
@@ -141,7 +140,7 @@ try:
     siril.connect()
     siril.reset_progress()
 
-    modelpath = os.path.join(siril.get_siril_configdir(),"scunet_color_real_psnr.pth")
+    modelpath = os.path.join(siril.get_siril_userdatadir(),"scunet_color_real_psnr.pth")
 
     if os.path.isfile(modelpath) :
         print("SCUnet model found : "+modelpath)
