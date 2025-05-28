@@ -156,19 +156,24 @@ try:
     siril.update_progress("SCUNet model initialised",0.05)
 
     image  = siril.get_image()
-    image.ensure_data_type(np.float32)
+
+    # Normalize if pixel values exceed [0,1]
+    pixel_data = image.data
+    original_dtype = pixel_data.dtype
+    if original_dtype == np.uint16:
+        pixel_data = pixel_data.astype(np.float32) / 65535.0
 
     # read image out send it to the GPU
     # Handle planar format (c, h, w) -> (h, w, c)
-    imagecv2in = np.transpose(image.data, (1, 2, 0))
+    pixel_data = np.transpose(pixel_data, (1, 2, 0))
 
     tile_size = 512
     scale = 1
 
     # Allocate an image to save the tiles
-    imgresult = imagecv2in.copy()
+    imgresult = pixel_data.copy()
 
-    for i, tile in enumerate(tile_process(device, model, imagecv2in, scale, tile_size, yield_extra_details=True)):
+    for i, tile in enumerate(tile_process(device, model, pixel_data, scale, tile_size, yield_extra_details=True)):
 
         if tile is None:
             break
@@ -181,6 +186,11 @@ try:
 
     # Convert back to planar format
     output_image = np.transpose(imgresult, (2, 0, 1))
+
+    # Scale back if needed
+    if original_dtype == np.uint16:
+        output_image = output_image * 65535.0
+        output_image = output_image.astype(np.uint16)
 
     siril.undo_save_state("SCUnet denoise")
     with siril.image_lock(): siril.set_image_pixeldata(output_image)
