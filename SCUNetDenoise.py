@@ -77,8 +77,6 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         if tiles_y*tile_size < height:
             tiles_y+=1
 
-        print("nb tile x :"+str(tiles_x)+" y :"+str(tiles_y))
-
         for i in range(tiles_x * tiles_y):
             x = math.floor(i/tiles_y)
             y = i % tiles_y
@@ -97,9 +95,6 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
 
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
-
-            print("input_start_x :"+str(input_start_x)+" input_end_x :"+str(input_end_x))
-            print("input_start_y :"+str(input_start_y)+" input_end_y :"+str(input_end_y))
 
             input_start_x_pad = max(input_start_x - tile_pad, 0)
             input_end_x_pad = min(input_end_x + tile_pad, width)
@@ -157,11 +152,13 @@ try:
 
     image  = siril.get_image()
 
-    # Normalize if pixel values exceed [0,1]
-    pixel_data = image.data
-    original_dtype = pixel_data.dtype
+    # convert pixel data to 32 bit if 16bit mode is used
+    original_data = image.data
+    original_dtype = original_data.dtype
     if original_dtype == np.uint16:
-        pixel_data = pixel_data.astype(np.float32) / 65535.0
+        pixel_data = original_data.astype(np.float32) / 65535.0
+    else:
+        pixel_data = original_data
 
     # read image out send it to the GPU
     # Handle planar format (c, h, w) -> (h, w, c)
@@ -192,8 +189,20 @@ try:
         output_image = output_image * 65535.0
         output_image = output_image.astype(np.uint16)
 
+    strength = 0.5
+
+    # blend
+    if strength != 1.0:
+        original_dtype = output_image.dtype
+        blended = output_image * strength + \
+                original_data * (1 - strength)
+        if blended.dtype != original_dtype:
+            blended = blended.astype(original_dtype)
+    else:
+        blended = output_image
+
     siril.undo_save_state("SCUnet denoise")
-    with siril.image_lock(): siril.set_image_pixeldata(output_image)
+    with siril.image_lock(): siril.set_image_pixeldata(blended)
 
     siril.update_progress("Image denoised",1.0)
 
