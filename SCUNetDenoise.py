@@ -27,9 +27,6 @@ import math
 s.ensure_installed("torch")
 import torch
 
-s.ensure_installed("opencv-python")
-import cv2
-
 s.ensure_installed("spandrel")
 from spandrel import ImageModelDescriptor, ModelLoader
 
@@ -50,7 +47,7 @@ def image_to_tensor(device: torch.device, img: np.ndarray) -> torch.Tensor:
     return tensor.to(device)
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
-    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 65535).astype(np.uint16)
+    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0)).astype(np.float32)
 
 def image_inference_tensor(
     model: ImageModelDescriptor, tensor: torch.Tensor
@@ -69,7 +66,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
         data = np.expand_dims(data, axis=0)
-        data = np.clip(data, 0, 65535)
+        #data = np.clip(data, 0, 65535)
 
         batch, channel, height, width = data.shape
         print("height :"+str(height)+" width :"+str(width))
@@ -113,7 +110,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
 
-            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32) / 65535
+            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32)
 
             output_tile = image_inference_tensor(model,image_to_tensor(device, input_tile))
             progress = (i+1) / (tiles_y * tiles_x)
@@ -168,26 +165,15 @@ try:
 
     siril.update_progress("SCUNet model initialised",0.05)
 
-    # Create a temporary file
-    with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as temp_file:
-        temp_filename = temp_file.name
-        siril.log(f"Temporary file created: {temp_filename}")
-
-    # Save current file
-    siril.cmd("savetif", os.path.splitext(temp_filename)[0], " -astro")
-    siril.log(f"FITS file saved: {temp_filename}")
-
     # read image out send it to the GPU
-    imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_UNCHANGED)
-    original_height, original_width, channels = imagecv2in.shape
-
-    print("original_height :"+str(original_height)+" original_width :"+str(original_width))
+    # Handle planar format (c, h, w) -> (h, w, c)
+    imagecv2in = np.transpose(siril.get_image_pixeldata(), (1, 2, 0))
 
     tile_size = 512
     scale = 1
 
     # Allocate an image to save the tiles
-    imgresult = cv2.copyMakeBorder(imagecv2in,0,0,0,0,cv2.BORDER_REPLICATE)
+    imgresult = imagecv2in.copy()
 
     for i, tile in enumerate(tile_process(device, model, imagecv2in, scale, tile_size, yield_extra_details=True)):
 
@@ -200,14 +186,15 @@ try:
 
         siril.update_progress("Image denoising ongoing",p)
 
-    # write the image to the disk
-    cv2.imwrite(temp_filename, imgresult)
+    # Convert back to planar format
+    output_image = np.transpose(imgresult, (2, 0, 1))
+
+    siril.undo_save_state("SCUnet denoise")
+    with siril.image_lock(): siril.set_image_pixeldata(output_image)
 
     siril.update_progress("Image denoised",1.0)
 
-    # Load back into Siril
-    siril.cmd("load", temp_filename)
-    siril.log(f"FITS file loaded: {temp_filename}")
+
 
 except Exception as e :
     print("\n**** ERROR *** " +  str(e) + "\n" )
