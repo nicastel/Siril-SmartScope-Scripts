@@ -67,10 +67,8 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
         data = np.expand_dims(data, axis=0)
-        #data = np.clip(data, 0, 65535)
 
         batch, channel, height, width = data.shape
-        print("height :"+str(height)+" width :"+str(width))
 
         tiles_x = width // tile_size
         if tiles_x*tile_size < width:
@@ -82,8 +80,6 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         for i in range(tiles_x * tiles_y):
             x = math.floor(i/tiles_y)
             y = i % tiles_y
-
-            print("tile x :"+str(x)+" y :"+str(y))
 
             if x<tiles_x-1:
                 input_start_x = x * tile_size
@@ -97,16 +93,10 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
 
-            print("input_start_x :"+str(input_start_x)+" input_end_x :"+str(input_end_x))
-            print("input_start_y :"+str(input_start_y)+" input_end_y :"+str(input_end_y))
-
             input_start_x_pad = max(input_start_x - tile_pad, 0)
             input_end_x_pad = min(input_end_x + tile_pad, width)
             input_start_y_pad = max(input_start_y - tile_pad, 0)
             input_end_y_pad = min(input_end_y + tile_pad, height)
-
-            print("input_start_x_pad :"+str(input_start_x_pad)+" input_end_x_pad :"+str(input_end_x_pad))
-            print("input_start_y_pad :"+str(input_start_y_pad)+" input_end_y_pad :"+str(input_end_y_pad))
 
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
@@ -121,9 +111,6 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
             output_start_y_tile = (input_start_y - input_start_y_pad) * scale
             output_end_y_tile = output_start_y_tile + (input_tile_height * scale)
 
-            print("output_start_x_tile :"+str(output_start_x_tile)+" output_end_x_tile :"+str(output_end_x_tile))
-            print("output_start_y_tile :"+str(output_start_y_tile)+" output_end_y_tile :"+str(output_end_y_tile))
-
             output_tile = output_tile[:, :, output_start_y_tile:output_end_y_tile, output_start_x_tile:output_end_x_tile]
 
             output_tile = tensor_to_image(output_tile)
@@ -135,14 +122,8 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
 
         yield None
 
-# Set image warning and max sizes
-WARNING_SIZE = 4096
-MAX_SIZE = None
-#Image.MAX_IMAGE_PIXELS = 8192
-
 print("SCUNetDenoise:begin")
 siril = s.SirilInterface()
-temp_filename = None
 
 try:
     siril.connect()
@@ -195,18 +176,8 @@ try:
 
     siril.update_progress("Image denoised",1.0)
 
-
-
 except Exception as e :
     print("\n**** ERROR *** " +  str(e) + "\n" )
-finally:
-    # Clean up: delete the temporary file
-    if temp_filename and os.path.exists(temp_filename):
-        try:
-           os.remove(temp_filename)
-           siril.log(f"Temporary file deleted: {temp_filename}")
-        except OSError as e:
-           siril.log(f"Failed to delete temporary file: {str(e)}")
 
 siril.disconnect()
 del siril
