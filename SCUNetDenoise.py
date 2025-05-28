@@ -24,6 +24,7 @@ import ssl
 import tempfile
 import math
 
+print("Warning: a significant size of packages are about to be downloaded and installed and it will take some time")
 s.ensure_installed("torch")
 import torch
 
