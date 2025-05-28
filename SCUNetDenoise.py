@@ -77,6 +77,8 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         if tiles_y*tile_size < height:
             tiles_y+=1
 
+        print("nb tile x :"+str(tiles_x)+" y :"+str(tiles_y))
+
         for i in range(tiles_x * tiles_y):
             x = math.floor(i/tiles_y)
             y = i % tiles_y
@@ -90,8 +92,14 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
             else:
                 input_start_y = height - tile_size
 
+            if input_start_x < 0 : input_start_x = 0
+            if input_start_y < 0 : input_start_y = 0
+
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
+
+            print("input_start_x :"+str(input_start_x)+" input_end_x :"+str(input_end_x))
+            print("input_start_y :"+str(input_start_y)+" input_end_y :"+str(input_end_y))
 
             input_start_x_pad = max(input_start_x - tile_pad, 0)
             input_end_x_pad = min(input_end_x + tile_pad, width)
