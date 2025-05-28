@@ -75,7 +75,11 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         print("height :"+str(height)+" width :"+str(width))
 
         tiles_x = width // tile_size
+        if tiles_x*tile_size < width:
+            tiles_x+=1
         tiles_y = height // tile_size
+        if tiles_y*tile_size < height:
+            tiles_y+=1
 
         for i in range(tiles_x * tiles_y):
             x = math.floor(i/tiles_y)
@@ -83,8 +87,14 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
 
             print("tile x :"+str(x)+" y :"+str(y))
 
-            input_start_x = x * tile_size
-            input_start_y = y * tile_size
+            if x<tiles_x-1:
+                input_start_x = x * tile_size
+            else:
+                input_start_x = width - tile_size
+            if y<tiles_y-1:
+                input_start_y = y * tile_size
+            else:
+                input_start_y = height - tile_size
 
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
@@ -176,13 +186,10 @@ try:
     tile_size = 512
     scale = 1
 
-    # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
-    imgcv2resized = cv2.resize(imagecv2in,(original_width//tile_size * tile_size + tile_size,original_height//tile_size * tile_size + tile_size),interpolation=cv2.INTER_CUBIC)
-
     # Allocate an image to save the tiles
-    imgresult = cv2.copyMakeBorder(imgcv2resized,0,0,0,0,cv2.BORDER_REPLICATE)
+    imgresult = cv2.copyMakeBorder(imagecv2in,0,0,0,0,cv2.BORDER_REPLICATE)
 
-    for i, tile in enumerate(tile_process(device, model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
+    for i, tile in enumerate(tile_process(device, model, imagecv2in, scale, tile_size, yield_extra_details=True)):
 
         if tile is None:
             break
@@ -193,11 +200,8 @@ try:
 
         siril.update_progress("Image denoising ongoing",p)
 
-    # Resize back to the expected size
-    imagecv2out = cv2.resize(imgresult,(original_width*scale,original_height*scale),interpolation=cv2.INTER_CUBIC)
-
     # write the image to the disk
-    cv2.imwrite(temp_filename, imagecv2out)
+    cv2.imwrite(temp_filename, imgresult)
 
     siril.update_progress("Image denoised",1.0)
 
