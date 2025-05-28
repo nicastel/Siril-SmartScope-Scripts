@@ -147,9 +147,12 @@ try:
 
     siril.update_progress("SCUNet model initialised",0.05)
 
+    image  = siril.get_image()
+    image.ensure_data_type(np.float32)
+
     # read image out send it to the GPU
     # Handle planar format (c, h, w) -> (h, w, c)
-    imagecv2in = np.transpose(siril.get_image_pixeldata(), (1, 2, 0))
+    imagecv2in = np.transpose(image.data, (1, 2, 0))
 
     tile_size = 512
     scale = 1
