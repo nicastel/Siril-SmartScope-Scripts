@@ -34,18 +34,10 @@ from sirilpy import tksiril
 s.ensure_installed("torch")
 import torch
 
-s.ensure_installed("opencv-python")
-import cv2
-
 s.ensure_installed("spandrel")
 from spandrel import ImageModelDescriptor, ModelLoader
 
-VERSION = "1.0.0"
-
-# Set image warning and max sizes
-WARNING_SIZE = 4096
-MAX_SIZE = None
-#Image.MAX_IMAGE_PIXELS = 8192
+VERSION = "1.0.1"
 
 # list of models
 models = [["AstroSleuthV1","https://github.com/Aveygo/AstroSleuth/releases/download/v1/AstroSleuthV1.pth"],
@@ -70,7 +62,7 @@ def image_to_tensor(device: torch.device, img: np.ndarray) -> torch.Tensor:
     return tensor.to(device)
 
 def tensor_to_image(tensor: torch.Tensor) -> np.ndarray:
-    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0).clip(0,1) * 65535).astype(np.uint16)
+    return (np.rollaxis(tensor.cpu().detach().numpy(), 1, 4).squeeze(0)).astype(np.float32)
 
 def image_inference_tensor(
     model: ImageModelDescriptor, tensor: torch.Tensor
@@ -89,22 +81,34 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
         # [height, width, channel] -> [1, channel, height, width]
         data = np.rollaxis(data, 2, 0)
         data = np.expand_dims(data, axis=0)
-        data = np.clip(data, 0, 65535)
 
         batch, channel, height, width = data.shape
         print("height :"+str(height)+" width :"+str(width))
 
         tiles_x = width // tile_size
+        if tiles_x*tile_size < width:
+            tiles_x+=1
         tiles_y = height // tile_size
+        if tiles_y*tile_size < height:
+            tiles_y+=1
 
         for i in range(tiles_x * tiles_y):
-            x = i % tiles_y
-            y = math.floor(i/tiles_y)
+            x = math.floor(i/tiles_y)
+            y = i % tiles_y
 
             print("tile x :"+str(x)+" y :"+str(y))
 
-            input_start_x = y * tile_size
-            input_start_y = x * tile_size
+            if x<tiles_x-1:
+                input_start_x = x * tile_size
+            else:
+                input_start_x = width - tile_size
+            if y<tiles_y-1:
+                input_start_y = y * tile_size
+            else:
+                input_start_y = height - tile_size
+
+            if input_start_x < 0 : input_start_x = 0
+            if input_start_y < 0 : input_start_y = 0
 
             input_end_x = min(input_start_x + tile_size, width)
             input_end_y = min(input_start_y + tile_size, height)
@@ -123,7 +127,7 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
             input_tile_width = input_end_x - input_start_x
             input_tile_height = input_end_y - input_start_y
 
-            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32) / 65535
+            input_tile = data[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad].astype(np.float32)
 
             output_tile = image_inference_tensor(model,image_to_tensor(device, input_tile))
             progress = (i+1) / (tiles_y * tiles_x)
@@ -240,13 +244,15 @@ class SirilAstroSleuth:
     async def _apply_changes(self):
         temp_filename = None
         try:
+            print("AstroSleuthUpscale:begin")
+
              # Read user input values
             model = self.model_var.get()
             print (model)
 
             self.siril.reset_progress()
 
-            modelpath = os.path.join(self.siril.get_siril_configdir(),os.path.basename(model))
+            modelpath = os.path.join(self.siril.get_siril_userdatadir(),os.path.basename(model))
 
             if os.path.isfile(modelpath) :
                 print("model found : "+modelpath)
@@ -263,32 +269,30 @@ class SirilAstroSleuth:
             assert isinstance(model, ImageModelDescriptor)
 
             self.siril.update_progress("model initialised",0.05)
+            image  = self.siril.get_image()
 
-            # Create a temporary file
-            with tempfile.NamedTemporaryFile(suffix=".tif", delete=False) as temp_file:
-                temp_filename = temp_file.name
-                self.siril.log(f"Temporary file created: {temp_filename}")
-
-            # Save current file
-            self.siril.cmd("savetif", os.path.splitext(temp_filename)[0], " -astro")
-            self.siril.log(f"FITS file saved: {temp_filename}")
+            # convert pixel data to 32 bit if 16bit mode is used
+            original_data = image.data
+            original_dtype = original_data.dtype
+            if original_dtype == np.uint16:
+                pixel_data = original_data.astype(np.float32) / 65535.0
+            else:
+                pixel_data = original_data
 
             # read image out send it to the GPU
-            imagecv2in = cv2.imread(temp_filename, cv2.IMREAD_UNCHANGED)
-            original_height, original_width, channels = imagecv2in.shape
+            # Handle planar format (c, h, w) -> (h, w, c)
+            pixel_data = np.transpose(pixel_data, (1, 2, 0))
+            original_height, original_width, channels = pixel_data.shape
 
             print("original_height :"+str(original_height)+" original_width :"+str(original_width))
 
             tile_size = 256
             scale = 4
 
-            # Because tiles may not fit perfectly, we resize to the closest multiple of tile_size
-            imgcv2resized = cv2.resize(imagecv2in,(original_width//tile_size * tile_size + tile_size,original_height//tile_size * tile_size + tile_size),interpolation=cv2.INTER_CUBIC)
-
             # Allocate an image to save the tiles
-            imgresult = cv2.resize(imgcv2resized,None,fx=scale,fy=scale,interpolation=cv2.INTER_CUBIC)
+            imgresult = np.zeros((original_height*scale,original_width*scale,channels), dtype=np.float32)
 
-            for i, tile in enumerate(tile_process(device, model, imgcv2resized, scale, tile_size, yield_extra_details=True)):
+            for i, tile in enumerate(tile_process(device, model, pixel_data, scale, tile_size, yield_extra_details=True)):
 
                 if tile is None:
                     break
@@ -299,30 +303,24 @@ class SirilAstroSleuth:
 
                 self.siril.update_progress("Image upscale ongoing",p)
 
-            # Resize back to the expected size
-            imagecv2out = cv2.resize(imgresult,(original_width*scale,original_height*scale),interpolation=cv2.INTER_CUBIC)
+            # Convert back to planar format
+            output_image = np.transpose(imgresult, (2, 0, 1))
 
-            # write the image to the disk
-            cv2.imwrite(temp_filename, imagecv2out)
+            # Scale back if needed
+            if original_dtype == np.uint16:
+                output_image = output_image * 65535.0
+                output_image = output_image.astype(np.uint16)
+
+            self.siril.undo_save_state("AstroSleuth upscale")
+            with self.siril.image_lock(): self.siril.set_image_pixeldata(output_image)
 
             self.siril.update_progress("Image upscaled",1.0)
-
-            # Load back into Siril
-            self.siril.cmd("load", temp_filename)
-            self.siril.log(f"FITS file loaded: {temp_filename}")
-            self.siril.log("AstroSleuth Upscale complete.")
 
         except Exception as e:
             print(f"Error in apply_changes: {str(e)}")
             self.siril.update_progress(f"Error: {str(e)}", 0)
         finally:
-            # Clean up: delete the temporary file
-            if temp_filename and os.path.exists(temp_filename):
-                try:
-                   os.remove(temp_filename)
-                   self.siril.log(f"Temporary file deleted: {temp_filename}")
-                except OSError as e:
-                   self.siril.log(f"Failed to delete temporary file: {str(e)}")
+            print("AstroSleuthUpscale:end")
 
 def main():
     try:
