@@ -17,6 +17,7 @@
 
 import sys
 import os
+import asyncio
 import sirilpy as s
 import numpy as np
 import urllib.request
@@ -25,11 +26,30 @@ import tempfile
 import math
 
 print("Warning: a significant size of packages are about to be downloaded and installed and it will take some time")
+
+s.ensure_installed("ttkthemes")
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+from ttkthemes import ThemedTk
+from sirilpy import tksiril
+
 s.ensure_installed("torch")
 import torch
 
 s.ensure_installed("spandrel")
 from spandrel import ImageModelDescriptor, ModelLoader
+
+VERSION = "1.0.2"
+
+# list of models
+models = [["SCUNet Color Real PSNR","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth"],
+    ["SCUNet Color Real GAN","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_gan.pth"],
+    ["SCUNet Color 15","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_15.pth"],
+    ["SCUNet Color 25","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_25.pth"],
+    ["SCUNet Color 50","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_50.pth"],
+    ["UberSmooth dso stars 0.1","https://ubersmooth.com/uberSmooth-dso-stars-v0.1.zip"],
+    ["UberSmooth dso stars 0.2","https://ubersmooth.com/uberSmooth-dso-stars-v0.2.zip"],
+    ["UberSmooth planetary 0.1","https://ubersmooth.com/uberSmooth-planetary-v0.1.zip"]]
 
 # suppported for SCUNet : Nvidia GPU / Apple MPS / DirectML on Windows / CPU
 def get_device() -> torch.device:
@@ -125,90 +145,198 @@ def tile_process(device: torch.device, model: ImageModelDescriptor, data: np.nda
 
         yield None
 
-print("SCUNetDenoise:begin")
-siril = s.SirilInterface()
+class SirilScunet:
+    def __init__(self, root):
+        self.root = root
+        self.root.title(f"SCUNet Denoise - v{VERSION}")
+        self.root.resizable(False, False)
 
-try:
-    siril.connect()
-    siril.reset_progress()
+        self.style = tksiril.standard_style()
 
-    modelpath = os.path.join(siril.get_siril_userdatadir(),"scunet_color_real_psnr.pth")
+        # Initialize Siril connection
+        self.siril = s.SirilInterface()
 
-    if os.path.isfile(modelpath) :
-        print("SCUnet model found : "+modelpath)
-    else :
-        ssl._create_default_https_context = ssl._create_stdlib_context
-        urllib.request.urlretrieve("https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth", modelpath)
-        print("SCUnet model downloaded : "+modelpath)
+        if not self.siril.connect():
+            self.siril.error_messagebox("Failed to connect to Siril")
+            self.close_dialog()
+            return
 
-    device = get_device()
+        if not self.siril.is_image_loaded():
+            self.siril.error_messagebox("No image loaded")
+            self.close_dialog()
+            return
 
-    # load a model from disk
-    model = ModelLoader().load_from_file(r""+modelpath).eval().to(device)
-    # make sure it's an image to image model
-    assert isinstance(model, ImageModelDescriptor)
+        try:
+            self.siril.cmd("requires", "1.3.6")
+        except s.CommandError:
+            self.close_dialog()
+            return
 
-    siril.update_progress("SCUNet model initialised",0.05)
+        tksiril.match_theme_to_siril(self.root, self.siril)
 
-    image  = siril.get_image()
+        # Create widgets
+        self.create_widgets()
 
-    # convert pixel data to 32 bit if 16bit mode is used
-    original_data = image.data
-    original_dtype = original_data.dtype
-    if original_dtype == np.uint16:
-        pixel_data = original_data.astype(np.float32) / 65535.0
-    else:
-        pixel_data = original_data
+    def create_widgets(self):
+        # Main frame
+        main_frame = ttk.Frame(self.root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
 
-    # read image out send it to the GPU
-    # Handle planar format (c, h, w) -> (h, w, c)
-    pixel_data = np.transpose(pixel_data, (1, 2, 0))
+        # Title
+        title_label = ttk.Label(
+            main_frame,
+            text="SCUNet Denoise Settings",
+            style="Header.TLabel"
+        )
+        title_label.pack(pady=(0, 20))
 
-    tile_size = 512
-    scale = 1
+        # Model Selection Frame
+        model_frame = ttk.LabelFrame(main_frame, text="Model selection", padding=10)
+        model_frame.pack(fill=tk.X, padx=5, pady=5)
 
-    # Allocate an image to save the tiles
-    imgresult = pixel_data.copy()
+        self.model_var = tk.StringVar(value="https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth")
+        for model in models:
+            ttk.Radiobutton(
+                model_frame,
+                text=model[0],
+                variable=self.model_var,
+                value=model[1]
+            ).pack(anchor=tk.W, pady=2)
 
-    for i, tile in enumerate(tile_process(device, model, pixel_data, scale, tile_size, yield_extra_details=True)):
+        # Action Buttons
+        button_frame = ttk.Frame(main_frame)
+        button_frame.pack(pady=10)
 
-        if tile is None:
-            break
+        close_btn = ttk.Button(
+            button_frame,
+            text="Close",
+            command=self.close_dialog,
+            style="TButton"
+        )
+        close_btn.pack(side=tk.LEFT, padx=5)
 
-        tile_data, x, y, w, h, p = tile
-        if w != 0 and h != 0 :
-            imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
+        apply_btn = ttk.Button(
+            button_frame,
+            text="Apply",
+            command=self._on_apply,
+            style="TButton"
+        )
+        apply_btn.pack(side=tk.LEFT, padx=5)
 
-        siril.update_progress("Image denoising ongoing",p)
+    def _on_apply(self):
+        # Wrap the async method to run in the event loop
+        self.root.after(0, self._run_async_task)
 
-    # Convert back to planar format
-    output_image = np.transpose(imgresult, (2, 0, 1))
+    def _run_async_task(self):
+        asyncio.run(self._apply_changes())
 
-    # Scale back if needed
-    if original_dtype == np.uint16:
-        output_image = output_image * 65535.0
-        output_image = output_image.astype(np.uint16)
+    def close_dialog(self):
+        self.siril.disconnect()
+        self.root.quit()
+        self.root.destroy()
 
-    strength = 0.5
+    async def _apply_changes(self):
+        temp_filename = None
+        try:
+             # Read user input values
+            model = self.model_var.get()
+            print (model)
 
-    # blend
-    if strength != 1.0:
-        original_dtype = output_image.dtype
-        blended = output_image * strength + \
-                original_data * (1 - strength)
-        if blended.dtype != original_dtype:
-            blended = blended.astype(original_dtype)
-    else:
-        blended = output_image
+            self.siril.reset_progress()
 
-    siril.undo_save_state("SCUnet denoise")
-    with siril.image_lock(): siril.set_image_pixeldata(blended)
+            modelpath = os.path.join(self.siril.get_siril_userdatadir(),os.path.basename(model))
 
-    siril.update_progress("Image denoised",1.0)
+            if os.path.isfile(modelpath) :
+                print("model found : "+modelpath)
+            else :
+                ssl._create_default_https_context = ssl._create_stdlib_context
+                urllib.request.urlretrieve(model, modelpath)
+                print("model downloaded : "+modelpath)
 
-except Exception as e :
-    print("\n**** ERROR *** " +  str(e) + "\n" )
+            device = get_device()
 
-siril.disconnect()
-del siril
-print("SCUNetDenoise:end")
+            # load a model from disk
+            model = ModelLoader().load_from_file(r""+modelpath).eval().to(device)
+            # make sure it's an image to image model
+            assert isinstance(model, ImageModelDescriptor)
+
+            self.siril.update_progress("model initialised",0.05)
+            image  = self.siril.get_image()
+
+            # convert pixel data to 32 bit if 16bit mode is used
+            original_data = image.data
+            original_dtype = original_data.dtype
+            if original_dtype == np.uint16:
+                pixel_data = original_data.astype(np.float32) / 65535.0
+            else:
+                pixel_data = original_data
+
+            # read image out send it to the GPU
+            # Handle planar format (c, h, w) -> (h, w, c)
+            pixel_data = np.transpose(pixel_data, (1, 2, 0))
+
+            tile_size = 512
+            scale = 1
+
+            # Allocate an image to save the tiles
+            imgresult = pixel_data.copy()
+
+            for i, tile in enumerate(tile_process(device, model, pixel_data, scale, tile_size, yield_extra_details=True)):
+
+                if tile is None:
+                    break
+
+                tile_data, x, y, w, h, p = tile
+                if w != 0 and h != 0 :
+                    imgresult[x*scale:x*scale+tile_size*scale,y*scale:y*scale+tile_size*scale] = tile_data
+
+                self.siril.update_progress("Image denoising ongoing",p)
+
+            # Convert back to planar format
+            output_image = np.transpose(imgresult, (2, 0, 1))
+
+            # Scale back if needed
+            if original_dtype == np.uint16:
+                output_image = output_image * 65535.0
+                output_image = output_image.astype(np.uint16)
+
+            strength = 0.5
+
+            # blend
+            if strength != 1.0:
+                original_dtype = output_image.dtype
+                blended = output_image * strength + \
+                        original_data * (1 - strength)
+                if blended.dtype != original_dtype:
+                    blended = blended.astype(original_dtype)
+            else:
+                blended = output_image
+
+            self.siril.undo_save_state("SCUnet denoise")
+            with self.siril.image_lock(): self.siril.set_image_pixeldata(blended)
+
+            self.siril.update_progress("Image denoised",1.0)
+
+        except Exception as e:
+            print(f"Error in apply_changes: {str(e)}")
+            self.siril.update_progress(f"Error: {str(e)}", 0)
+        finally:
+            # Clean up: delete the temporary file
+            if temp_filename and os.path.exists(temp_filename):
+                try:
+                   os.remove(temp_filename)
+                   self.siril.log(f"Temporary file deleted: {temp_filename}")
+                except OSError as e:
+                   self.siril.log(f"Failed to delete temporary file: {str(e)}")
+
+def main():
+    try:
+        root = ThemedTk()
+        app = SirilScunet(root)
+        root.mainloop()
+    except Exception as e:
+        print(f"Error initializing application: {str(e)}")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
