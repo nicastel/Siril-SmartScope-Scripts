@@ -204,6 +204,29 @@ class SirilScunet:
                 value=model[1]
             ).pack(anchor=tk.W, pady=2)
 
+        self.strength_var = tk.DoubleVar(value=0.5)
+        # Strength slider for denoise
+        strength_frame = ttk.Frame(main_frame)
+        strength_frame.pack(fill=tk.X, padx=5, pady=5)
+        strength_label = ttk.Label(strength_frame, text="Strength:")
+        strength_label.pack(side=tk.LEFT, padx=5)
+        strength_slider = ttk.Scale(
+            strength_frame,
+            from_=0.0,
+            to=1.0,
+            orient=tk.HORIZONTAL,
+            variable=self.strength_var,
+            length=200
+        )
+        strength_slider.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5)
+        self.strength_value = ttk.Label(strength_frame, text="0.5")
+        self.strength_value.pack(side=tk.RIGHT, padx=5)
+        tksiril.create_tooltip(strength_slider, "Adjust the denoising strength. The "
+                "result is a linear blend of the denoised image and the original, "
+                "with the mixture of the two images controlled by the strength "
+                "parameter.")
+        self.strength_var.trace_add("write", self._update_strength_label)
+
         # Action Buttons
         button_frame = ttk.Frame(main_frame)
         button_frame.pack(pady=10)
@@ -224,6 +247,10 @@ class SirilScunet:
         )
         apply_btn.pack(side=tk.LEFT, padx=5)
 
+    def _update_strength_label(self, *args):
+        """Update the strength value label when slider changes"""
+        self.strength_value.config(text=f"{self.strength_var.get():.2f}")
+
     def _on_apply(self):
         # Wrap the async method to run in the event loop
         self.root.after(0, self._run_async_task)
@@ -242,7 +269,7 @@ class SirilScunet:
 
              # Read user input values
             model = self.model_var.get()
-            print (model)
+            strength = self.strength_var.get()
 
             self.siril.reset_progress()
 
@@ -307,8 +334,6 @@ class SirilScunet:
             if original_dtype == np.uint16:
                 output_image = output_image * 65535.0
                 output_image = output_image.astype(np.uint16)
-
-            strength = 0.5
 
             # blend
             if strength != 1.0:
