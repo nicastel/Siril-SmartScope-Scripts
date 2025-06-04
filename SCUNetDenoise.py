@@ -4,6 +4,7 @@
 # ------------------------------------------------------------------------------
 # Project: Python siril script to run SCUNet denoiser via spandrel
 # using model from https://github.com/cszn/SCUNet
+# and https://ubersmooth.com/
 #
 # ------------------------------------------------------------------------------
 #    Author:  Nicolas CASTEL <nic.castel (at) gmail.com>
@@ -48,9 +49,9 @@ models = [["SCUNet Color Real PSNR","https://github.com/cszn/KAIR/releases/downl
     ["SCUNet Color 15","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_15.pth"],
     ["SCUNet Color 25","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_25.pth"],
     ["SCUNet Color 50","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_50.pth"],
-    ["UberSmooth dso stars 0.1","https://ubersmooth.com/uberSmooth-dso-stars-v0.1.zip"],
-    ["UberSmooth dso stars 0.2","https://ubersmooth.com/uberSmooth-dso-stars-v0.2.zip"],
-    ["UberSmooth planetary 0.1","https://ubersmooth.com/uberSmooth-planetary-v0.1.zip"]]
+    ["uberSmooth dso stars 0.1","https://ubersmooth.com/uberSmooth-dso-stars-v0.1.zip"],
+    ["uberSmooth dso stars 0.2","https://ubersmooth.com/uberSmooth-dso-stars-v0.2.zip"],
+    ["uberSmooth planetary 0.1","https://ubersmooth.com/uberSmooth-planetary-v0.1.zip"]]
 
 # suppported for SCUNet : Nvidia GPU / Apple MPS / DirectML on Windows / CPU
 def get_device() -> torch.device:
