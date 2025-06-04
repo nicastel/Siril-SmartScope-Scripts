@@ -24,6 +24,7 @@ import urllib.request
 import ssl
 import tempfile
 import math
+import zipfile
 
 print("Warning: a significant size of packages are about to be downloaded and installed and it will take some time")
 
@@ -236,8 +237,9 @@ class SirilScunet:
         self.root.destroy()
 
     async def _apply_changes(self):
-        temp_filename = None
         try:
+            print("SCUNetDenoise:begin")
+
              # Read user input values
             model = self.model_var.get()
             print (model)
@@ -252,6 +254,12 @@ class SirilScunet:
                 ssl._create_default_https_context = ssl._create_stdlib_context
                 urllib.request.urlretrieve(model, modelpath)
                 print("model downloaded : "+modelpath)
+
+            if(zipfile.is_zipfile(modelpath)) :
+                with zipfile.ZipFile(modelpath, 'r') as zip_ref:
+                    zip_ref.extractall()
+                    modelpath = modelpath.replace(".zip",".pth")
+                    print("model extracted : "+modelpath)
 
             device = get_device()
 
@@ -321,13 +329,7 @@ class SirilScunet:
             print(f"Error in apply_changes: {str(e)}")
             self.siril.update_progress(f"Error: {str(e)}", 0)
         finally:
-            # Clean up: delete the temporary file
-            if temp_filename and os.path.exists(temp_filename):
-                try:
-                   os.remove(temp_filename)
-                   self.siril.log(f"Temporary file deleted: {temp_filename}")
-                except OSError as e:
-                   self.siril.log(f"Failed to delete temporary file: {str(e)}")
+            print("SCUNetDenoise:end")
 
 def main():
     try:
