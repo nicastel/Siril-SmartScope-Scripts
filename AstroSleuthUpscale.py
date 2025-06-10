@@ -24,6 +24,7 @@
 import sys, os, asyncio, urllib.request, ssl, math, base64
 import sirilpy as s
 from sirilpy import tksiril
+from sirilpy.tksiril import create_tooltip
 
 s.ensure_installed("numpy")
 import numpy as np
@@ -533,12 +534,13 @@ class SirilAstroSleuth:
             width=10
         )
         upscale_dropdown.pack(side=tk.LEFT, padx=5)
+        create_tooltip(upscale_dropdown, "Output scale in relation to input source image.", wrap_length=250)
 
         # Slider parameters
         slider_params = [
-            {"name": "Strength", "from_": 0, "to": 5, "default": 0.5},
-            {"name": "Detail", "from_": -1, "to": 1, "default": 0.0},
-            {"name": "Stars", "from_": -1, "to": 1, "default": 0.0}
+            {"name": "Strength", "from_": 0, "to": 5, "default": 0.5, "description": "'Amplifies' effects; recommended to keep below 1 to reduce artifacting"},
+            {"name": "Detail", "from_": -1, "to": 1, "default": 0.0, "description": "Higher values correspond to reduce blurring at the cost of added noise."},
+            {"name": "Stars", "from_": -1, "to": 1, "default": 0.0, "description": "Lower values correspond to reduced star sizes and density."}
         ]
 
         # Create sliders
@@ -558,6 +560,7 @@ class SirilAstroSleuth:
             )
             self.sliders[name].pack(fill=tk.X, padx=5, pady=5)
 
+
             # Create value label
             self.value_labels[name] = ttk.Label(
                 frame,
@@ -573,6 +576,18 @@ class SirilAstroSleuth:
 
             self.sliders[name].bind("<B1-Motion>", update_label)
             self.sliders[name].bind("<ButtonRelease-1>", update_label)
+
+            create_tooltip(self.value_labels[name], param["description"], wrap_length=250)
+
+        # Color Matching Checkbox
+        self.color_matching_var = tk.BooleanVar(value=False)
+        color_matching_check = ttk.Checkbutton(
+            main_frame,
+            text="Enable Color Matching",
+            variable=self.color_matching_var
+        )
+        color_matching_check.pack(fill=tk.X, padx=5, pady=5)
+        create_tooltip(color_matching_check, "Upscale the source image in B/W, then apply upsampled colors via bilinear interpolation. Performs poorly if source image is too noisy.", wrap_length=250)
 
         # Action Buttons
         button_frame = ttk.Frame(main_frame)
@@ -661,7 +676,8 @@ class SirilAstroSleuth:
                 "detail_strength": self.sliders["detail"].get(),
                 "cond_strength": self.sliders["strength"].get(),
                 "use_cond": not self.sliders["detail"].get() == 0,
-                "scale": float(scale)
+                "scale": float(scale),
+                "color_matching": self.color_matching_var.get()
             }
 
             print(f"Running with config: {model_config}")
