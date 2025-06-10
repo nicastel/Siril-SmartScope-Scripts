@@ -43,7 +43,7 @@ from torch import nn as nn
 # Config
 # ------------------------------------------------------------------------------
 
-VERSION = "1.0.1"
+VERSION = "1.0.2"
 MODEL_SRC = "https://github.com/Aveygo/AstroSleuth/releases/download/v4/AstroSleuthNEXT.pth"
 
 # ------------------------------------------------------------------------------
