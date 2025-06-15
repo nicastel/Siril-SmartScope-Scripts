@@ -44,14 +44,14 @@ from spandrel import ImageModelDescriptor, ModelLoader
 VERSION = "1.0.2"
 
 # list of models
-models = [["SCUNet Color Real PSNR","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth"],
-    ["SCUNet Color Real GAN","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_gan.pth"],
-    ["SCUNet Color 15","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_15.pth"],
-    ["SCUNet Color 25","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_25.pth"],
-    ["SCUNet Color 50","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_50.pth"],
-    ["uberSmooth dso stars 0.1","https://ubersmooth.com/uberSmooth-dso-stars-v0.1.zip"],
-    ["uberSmooth dso stars 0.2","https://ubersmooth.com/uberSmooth-dso-stars-v0.2.zip"],
-    ["uberSmooth planetary 0.1","https://ubersmooth.com/uberSmooth-planetary-v0.1.zip"]]
+models = [["SCUNet Color Real PSNR","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth","best all around model but can be too aggressive on stars"],
+    ["SCUNet Color Real GAN","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_gan.pth","less agreesive denoise"],
+    ["SCUNet Color 15","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_15.pth","gaussian noise level 15"],
+    ["SCUNet Color 25","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_25.pth","gaussian noise level 25"],
+    ["SCUNet Color 50","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_50.pth","gaussian noise level 50"],
+    ["UberSmooth dso stars 0.1","https://ubersmooth.com/uberSmooth-dso-stars-v0.1.zip","pretty good on stars but too aggressive on Hii regions within galaxies"],
+    ["UberSmooth dso stars 0.2","https://ubersmooth.com/uberSmooth-dso-stars-v0.2.zip","not as aggressive as UberSmooth 0.1, but also not great"],
+    ["UberSmooth planetary 0.1","https://ubersmooth.com/uberSmooth-planetary-v0.1.zip","only denoise/deblur no extra star treatment"]]
 
 # suppported for SCUNet : Nvidia GPU / Apple MPS / DirectML on Windows / CPU
 def get_device() -> torch.device:
@@ -198,12 +198,14 @@ class SirilScunet:
 
         self.model_var = tk.StringVar(value="https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth")
         for model in models:
-            ttk.Radiobutton(
+            rbutton = ttk.Radiobutton(
                 model_frame,
                 text=model[0],
                 variable=self.model_var,
                 value=model[1]
-            ).pack(anchor=tk.W, pady=2)
+            )
+            rbutton.pack(anchor=tk.W, pady=2)
+            tksiril.create_tooltip(rbutton, model[2])
 
         self.strength_var = tk.DoubleVar(value=0.5)
         # Strength slider for denoise
