@@ -48,7 +48,7 @@ import torch
 s.ensure_installed("spandrel")
 from spandrel import ImageModelDescriptor, ModelLoader
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 
 # list of models
 models = [["SCUNet Color Real PSNR","https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth","best all around model but can be too aggressive on stars"],
