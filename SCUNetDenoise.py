@@ -27,6 +27,11 @@ import tempfile
 import math
 import zipfile
 
+# Check the module version is enough to provide TorchHelper
+if not s.check_module_version('>=0.7.46'):
+    print("Error: requires sirilpy module >= 0.7.46")
+    sys.exit(1)
+
 print("Warning: a significant size of packages are about to be downloaded and installed and it will take some time")
 
 s.ensure_installed("ttkthemes")
@@ -35,7 +40,9 @@ from tkinter import ttk, filedialog, messagebox
 from ttkthemes import ThemedTk
 from sirilpy import tksiril
 
-s.ensure_installed("torch")
+# Determine the correct torch package based on OS and hardware,
+# and ensure it is installed
+s.TorchHelper().ensure_torch()
 import torch
 
 s.ensure_installed("spandrel")
@@ -165,12 +172,6 @@ class SirilScunet:
 
         if not self.siril.is_image_loaded():
             self.siril.error_messagebox("No image loaded")
-            self.close_dialog()
-            return
-
-        try:
-            self.siril.cmd("requires", "1.3.6")
-        except s.CommandError:
             self.close_dialog()
             return
 
