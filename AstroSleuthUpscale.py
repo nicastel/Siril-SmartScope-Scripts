@@ -26,6 +26,13 @@ import sirilpy as s
 from sirilpy import tksiril
 from sirilpy.tksiril import create_tooltip
 
+# Check the module version is enough to provide TorchHelper
+if not s.check_module_version('>=0.7.46'):
+    print("Error: requires sirilpy module >= 0.7.46")
+    sys.exit(1)
+
+print("Warning: a significant size of packages are about to be downloaded and installed and it will take some time")
+
 s.ensure_installed("numpy")
 import numpy as np
 
@@ -34,7 +41,9 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 from ttkthemes import ThemedTk
 
-s.ensure_installed("torch")
+# Determine the correct torch package based on OS and hardware,
+# and ensure it is installed
+s.TorchHelper().ensure_torch()
 import torch
 from torch.nn import functional as F
 from torch import nn as nn
@@ -43,7 +52,7 @@ from torch import nn as nn
 # Config
 # ------------------------------------------------------------------------------
 
-VERSION = "1.0.2"
+VERSION = "1.0.3"
 MODEL_SRC = "https://github.com/Aveygo/AstroSleuth/releases/download/v4/AstroSleuthNEXT.pth"
 
 # ------------------------------------------------------------------------------
@@ -488,12 +497,6 @@ class SirilAstroSleuth:
 
         if not self.siril.is_image_loaded():
             self.siril.error_messagebox("No image loaded")
-            self.close_dialog()
-            return
-
-        try:
-            self.siril.cmd("requires", "1.3.6")
-        except s.CommandError:
             self.close_dialog()
             return
 
