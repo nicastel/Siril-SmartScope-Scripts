@@ -2,7 +2,7 @@
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Project: Python siril script to fix evscope2 fits header
+# Project: Python siril script to fix odyssey fits header
 #
 # ------------------------------------------------------------------------------
 #    Author:  Nicolas CASTEL <nic.castel (at) gmail.com>
