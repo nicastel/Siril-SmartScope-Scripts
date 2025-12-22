@@ -40,7 +40,8 @@ for file in os.listdir(siril.get_siril_wd()):
         hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
         hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
         hdr.set("YPIXSZ", 2.9)  # add a YPIXSZ header
-        hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
-        hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
+        if hdr["SOFTVER"].startswith("4.2"):
+            hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
+            hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
         fits.writeto(file, data, hdr, overwrite=True)
         print(file)
