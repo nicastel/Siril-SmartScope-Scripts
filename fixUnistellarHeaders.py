@@ -41,20 +41,29 @@ for file in os.listdir(siril.get_siril_wd()):
         hdr.set(
             "DEC", hdr["FOVDEC"]
         )  # add a DEC header based on the FOVDEC unistellar header
+        telescope = None
         if hdr["INSTRUME"].startswith("IMX224"):  # eVscope1 or eQuinox1
             hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
             hdr.set("XPIXSZ", 3.75)  # add a XPIXSZ header
             hdr.set("YPIXSZ", 3.75)  # add a YPIXSZ header
+            telescope = "eVscope v1.0"
         if hdr["INSTRUME"].startswith("IMX347"):  # eVscope2 or eQuinox2
             hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
             hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
             hdr.set("YPIXSZ", 2.9)  # add a YPIXSZ header
+            telescope = "eVscope v2.0"
         if hdr["INSTRUME"].startswith("IMX415"):  # Odyssey or Odyssey Pro
             hdr.set("FOCALLEN", 320.0)  # add a FOCALLEN header
             hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
             hdr.set("YPIXSZ", 1.45)  # add a YPIXSZ header
+
         if hdr["SOFTVER"].startswith("4.2"):  # fix for bayer issue with latest FW 4.2
             hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
             hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
+        elif telescope is not None:
+            hdr.set("TELESCOP", telescope)  # add a TELESCOP header for older FW version
+
         fits.writeto(file, data, hdr, overwrite=True)
         print(file)
+
+print("Done!")
