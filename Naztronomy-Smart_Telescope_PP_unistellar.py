@@ -853,6 +853,7 @@ class PreprocessingInterface(QMainWindow):
         file_name += f"__{current_datetime}{suffix}"
 
         try:
+            self.siril.cmd("setcompress", "0")
             self.siril.cmd(
                 "save",
                 f"{file_name}",
