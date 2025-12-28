@@ -432,7 +432,7 @@ class PreprocessingInterface(QMainWindow):
                         "TELESCOP", telescope
                     )  # add a TELESCOP header for older FW version
 
-                fits.writeto(file, data, hdr, overwrite=True)
+                fits.writeto(os.path.join(dir, file), data, hdr, overwrite=True)
                 print(file)
         print("Unistellar headers fixed!")
 
