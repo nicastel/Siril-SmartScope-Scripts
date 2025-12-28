@@ -152,7 +152,6 @@ FILTER_COMMANDS_MAP = {
     },
 }
 
-
 UI_DEFAULTS = {
     "feather_amount": 20,
     "drizzle_amount": 1.0,
@@ -392,6 +391,50 @@ class PreprocessingInterface(QMainWindow):
 
         except Exception as e:
             self.siril.log(f"Error reading telescope from FITS: {e}", LogColor.SALMON)
+
+    def fixUnistellarHeaders(self, dir_name):
+        dir = os.path.join(self.current_working_directory, dir_name)
+        for file in os.listdir(dir):
+            if file.upper().endswith("STACKINPUT.FITS") or file.upper().endswith(
+                "STACKINPUT.FIT"
+            ):
+                data, hdr = fits.getdata(os.path.join(dir, file), header=True)
+                hdr.set(
+                    "RA", hdr["FOVRA"]
+                )  # add a RA header based on the FOVRA unistellar header
+                hdr.set(
+                    "DEC", hdr["FOVDEC"]
+                )  # add a DEC header based on the FOVDEC unistellar header
+                telescope = None
+                if hdr["INSTRUME"].startswith("IMX224"):  # eVscope1 or eQuinox1
+                    hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
+                    hdr.set("XPIXSZ", 3.75)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 3.75)  # add a YPIXSZ header
+
+                if hdr["INSTRUME"].startswith("IMX347"):  # eVscope2 or eQuinox2
+                    hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
+                    hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 2.9)  # add a YPIXSZ header
+                    telescope = "eVscope v2.0"
+                if hdr["INSTRUME"].startswith("IMX415"):  # Odyssey or Odyssey Pro
+                    hdr.set("FOCALLEN", 320.0)  # add a FOCALLEN header
+                    hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 1.45)  # add a YPIXSZ header
+
+                if hdr["SOFTVER"].startswith(
+                    "4.2"
+                ):  # fix for bayer issue with latest FW 4.2
+                    hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
+                    hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
+
+                elif telescope is not None:
+                    hdr.set(
+                        "TELESCOP", telescope
+                    )  # add a TELESCOP header for older FW version
+
+                fits.writeto(file, data, hdr, overwrite=True)
+                print(file)
+        print("Unistellar headers fixed!")
 
     # Dirname: lights, darks, biases, flats
     def convert_files(self, dir_name):
@@ -1550,6 +1593,10 @@ class PreprocessingInterface(QMainWindow):
                 ra = header.get("RA")
                 dec = header.get("DEC")
 
+                if ra is None:
+                    ra = header.get("FOVRA")
+                    dec = header.get("FOVDEC")
+
                 if ra is not None and dec is not None:
                     self.target_coords = f"{ra},{dec}"
                     self.siril.log(
@@ -1588,6 +1635,9 @@ class PreprocessingInterface(QMainWindow):
 
         self.drizzle_status = drizzle
         self.drizzle_factor = drizzle_amount
+
+        if self.chosen_telescope.startswith("Unistellar"):
+            self.fixUnistellarHeaders(dir_name=output_name)
 
         # Output name is actually the name of the batched working directory
         self.convert_files(dir_name=output_name)
