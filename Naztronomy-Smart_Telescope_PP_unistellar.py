@@ -423,13 +423,16 @@ class PreprocessingInterface(QMainWindow):
                     hdr.set("YPIXSZ", 2.9)  # add a YPIXSZ header
                     telescope = "Odyssey"
 
-                if hdr["SOFTVER"].startswith(
-                    "4.2"
+                if hdr["SOFTVER"].startswith("4.2") and telescope.startswith(
+                    "eVscope"
                 ):  # fix for bayer issue with latest FW 4.2
                     hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
                     hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
+                else:
+                    hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
+                    hdr.set("YBAYROFF", 0)  # add a YPIXSZ header
 
-                elif hdr.get("TELESCOP") is None and telescope is not None:
+                if hdr.get("TELESCOP") is None and telescope is not None:
                     hdr.set(
                         "TELESCOP", telescope
                     )  # add a TELESCOP header for older FW version
