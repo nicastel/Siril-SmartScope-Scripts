@@ -420,6 +420,7 @@ class PreprocessingInterface(QMainWindow):
                     hdr.set("FOCALLEN", 320.0)  # add a FOCALLEN header
                     hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
                     hdr.set("YPIXSZ", 1.45)  # add a YPIXSZ header
+                    telescope = "Odyssey"
 
                 if hdr["SOFTVER"].startswith(
                     "4.2"
@@ -427,7 +428,7 @@ class PreprocessingInterface(QMainWindow):
                     hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
                     hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
 
-                elif telescope is not None:
+                elif hdr.get("TELESCOP") is None and telescope is not None:
                     hdr.set(
                         "TELESCOP", telescope
                     )  # add a TELESCOP header for older FW version
