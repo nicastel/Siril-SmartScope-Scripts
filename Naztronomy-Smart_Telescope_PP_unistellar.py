@@ -347,6 +347,7 @@ class PreprocessingInterface(QMainWindow):
             "Origin": "Celestron Origin",
             "eVscope v1.0": "Unistellar eVscope 1",
             "eVscope v2.0": "Unistellar eVscope 2",
+            "odyssey": "Unistellar Odyssey",
         }
 
         try:
@@ -418,8 +419,8 @@ class PreprocessingInterface(QMainWindow):
                     telescope = "eVscope v2.0"
                 if hdr["INSTRUME"].startswith("IMX415"):  # Odyssey or Odyssey Pro
                     hdr.set("FOCALLEN", 320.0)  # add a FOCALLEN header
-                    hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
-                    hdr.set("YPIXSZ", 1.45)  # add a YPIXSZ header
+                    hdr.set("XPIXSZ", 3.85)  # add a XPIXSZ header
+                    hdr.set("YPIXSZ", 3.85)  # add a YPIXSZ header
                     telescope = "Odyssey"
 
                 if hdr["SOFTVER"].startswith(
