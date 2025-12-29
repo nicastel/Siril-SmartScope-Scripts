@@ -48,7 +48,7 @@ CHANGELOG:
       - Allow changing batch size
       - Accepts master calibration frames (also creates master calibration frames)
       - Temporary workaround to cfa debayering bug in Siril when using drizzle and background extraction for seestars
-1.1.1 - Bug fixes:
+1.1.1 - Bug fixes: 
       - Fixed Celestron Origin focal length to 335mm
       - Fixed clean up for pre-pp files
 1.1.0 - Minor version update:
@@ -60,40 +60,40 @@ CHANGELOG:
 1.0.0 - initial release
 """
 
-import json
-import math
 import os
-import shutil
 import sys
+import math
+import shutil
 import time
-from datetime import datetime
-
 import sirilpy as s
+from datetime import datetime
+import json
+
 
 s.ensure_installed("PyQt6", "numpy", "astropy")
-import numpy as np
-from astropy.io import fits
-from PyQt6.QtCore import Qt
-from PyQt6.QtCore import pyqtSlot as Slot
-from PyQt6.QtGui import QFont, QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
     QApplication,
-    QCheckBox,
-    QComboBox,
-    QDoubleSpinBox,
-    QFileDialog,
-    QGridLayout,
-    QGroupBox,
-    QHBoxLayout,
-    QLabel,
     QMainWindow,
-    QMessageBox,
-    QPushButton,
-    QSpinBox,
-    QVBoxLayout,
     QWidget,
+    QVBoxLayout,
+    QHBoxLayout,
+    QGridLayout,
+    QLabel,
+    QPushButton,
+    QCheckBox,
+    QDoubleSpinBox,
+    QComboBox,
+    QGroupBox,
+    QMessageBox,
+    QFileDialog,
+    QSpinBox,
 )
+from PyQt6.QtCore import pyqtSlot as Slot, Qt
+from PyQt6.QtGui import QFont, QShortcut, QKeySequence
 from sirilpy import LogColor, NoImageError
+from astropy.io import fits
+import numpy as np
+
 
 # from tkinter import filedialog
 
@@ -109,9 +109,9 @@ TELESCOPES = [
     "Dwarf 3",
     "Dwarf 2",
     "Celestron Origin",
-    "Unistellar eVscope 1",
-    "Unistellar eVscope 2",
-    "Unistellar Odyssey",
+    "Unistellar eVscope 1 / eQuinox 1",
+    "Unistellar eVscope 2 / eQuinox 2",
+    "Unistellar Odyssey / Odyssey Pro",
 ]
 
 FILTER_OPTIONS_MAP = {
@@ -120,9 +120,9 @@ FILTER_OPTIONS_MAP = {
     "Dwarf 3": ["Astro filter (UV/IR)", "Dual-Band"],
     "Dwarf 2": ["Astro filter (UV/IR)"],
     "Celestron Origin": ["No Filter (Broadband)"],
-    "Unistellar eVscope 1": ["No Filter (Broadband)"],
-    "Unistellar eVscope 2": ["No Filter (Broadband)"],
-    "Unistellar Odyssey": ["No Filter (Broadband)"],
+    "Unistellar eVscope 1 / eQuinox 1": ["No Filter (Broadband)"],
+    "Unistellar eVscope 2 / eQuinox 2": ["No Filter (Broadband)"],
+    "Unistellar Odyssey / Odyssey Pro": ["No Filter (Broadband)"],
 }
 
 FILTER_COMMANDS_MAP = {
@@ -152,6 +152,7 @@ FILTER_COMMANDS_MAP = {
     },
 }
 
+
 UI_DEFAULTS = {
     "feather_amount": 20,
     "drizzle_amount": 1.0,
@@ -161,6 +162,7 @@ UI_DEFAULTS = {
 
 
 class PreprocessingInterface(QMainWindow):
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle(f"{APP_NAME} - v{VERSION}")
@@ -327,7 +329,7 @@ class PreprocessingInterface(QMainWindow):
         Please watch latest demos on https://youtube.com/Naztronomy which can answer most questions.
         Here are some Frequently Asked Questions:
         Q: Can it handle telescopes not listed in the dropdown?
-        A: Yes, but it will not mosaic them. It will do regular star registration.
+        A: Yes, but it will not mosaic them. It will do regular star registration. 
         Q: How do I get support?
         A: Join the Naztronomy Discord server for support and discussion. Please have your logs handy.
         Q: Where can I find the logs?
@@ -341,13 +343,14 @@ class PreprocessingInterface(QMainWindow):
         telescope_map = {
             "Seestar S30": "ZWO Seestar S30",
             "Seestar S50": "ZWO Seestar S50",
+            "S50": "ZWO Seestar S50",
             "DWARFIII": "Dwarf 3",
             "DWARF 3": "Dwarf 3",
             "DWARFII": "Dwarf 2",
             "Origin": "Celestron Origin",
-            "eVscope v1.0": "Unistellar eVscope 1",
-            "eVscope v2.0": "Unistellar eVscope 2",
-            "odyssey": "Unistellar Odyssey",
+            "eVscope v1.0": "Unistellar eVscope 1 / eQuinox 1",
+            "eVscope v2.0": "Unistellar eVscope 2 / eQuinox 2",
+            "odyssey": "Unistellar Odyssey / Odyssey Pro",
         }
 
         try:
@@ -383,6 +386,15 @@ class PreprocessingInterface(QMainWindow):
                     if telescope.startswith(telescope_local_name):
                         mapped_telescope = ui_name
                         break
+
+                if header.get("ORIGIN","NULL").startswith("Unistellar"):
+                    if header.get("INSTRUME","NULL").startswith("IMX224"):
+                        mapped_telescope = "Unistellar eVscope 1 / eQuinox 1"
+                    if header.get("INSTRUME","NULL").startswith("IMX347"):
+                        mapped_telescope = "Unistellar eVscope 2 / eQuinox 2"
+                    if header.get("INSTRUME","NULL").startswith("IMX415"):
+                        mapped_telescope = "Unistellar Odyssey / Odyssey Pro"
+
                 self.telescope_combo.setCurrentText(mapped_telescope)
                 self.chosen_telescope = mapped_telescope
                 self.siril.log(
@@ -411,7 +423,7 @@ class PreprocessingInterface(QMainWindow):
                     hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
                     hdr.set("XPIXSZ", 3.75)  # add a XPIXSZ header
                     hdr.set("YPIXSZ", 3.75)  # add a YPIXSZ header
-
+                    telescope = "eVscope v1.0"
                 if hdr["INSTRUME"].startswith("IMX347"):  # eVscope2 or eQuinox2
                     hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
                     hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
@@ -521,24 +533,6 @@ class PreprocessingInterface(QMainWindow):
             pixel_size = 1.45
             args.append(f"-focal={focal_len}")
             args.append(f"-pixelsize={pixel_size}")
-        # if self.chosen_telescope == "Unistellar eVscope 1":
-        #    args.append(self.target_coords)
-        #    focal_len = 450
-        #    pixel_size = 3.75
-        #    args.append(f"-focal={focal_len}")
-        #    args.append(f"-pixelsize={pixel_size}")
-        # if self.chosen_telescope == "Unistellar eVscope 2":
-        #    args.append(self.target_coords)
-        #    focal_len = 450
-        #    pixel_size = 2.9
-        #    args.append(f"-focal={focal_len}")
-        #    args.append(f"-pixelsize={pixel_size}")
-        # if self.chosen_telescope == "Unistellar Odyssey":
-        #    args.append(self.target_coords)
-        #    focal_len = 320
-        #    pixel_size = 1.45
-        #    args.append(f"-focal={focal_len}")
-        #    args.append(f"-pixelsize={pixel_size}")
 
         args.extend(["-nocache", "-force", "-disto=ps_distortion", "-order=4"])
         # args = ["platesolve", seq_name, "-disto=ps_distortion", "-force"]
@@ -549,7 +543,7 @@ class PreprocessingInterface(QMainWindow):
             return True
         except (s.DataError, s.CommandError, s.SirilError) as e:
             self.siril.log(f"seqplatesolve failed: {e}", LogColor.RED)
-            return True  # TODO: disabling fallback because Siril seems to be throwing a false error
+            return True # TODO: disabling fallback because Siril seems to be throwing a false error 
 
     # Regular registration if plate solve not available - No Mosaics
     def regular_register_seq(self, seq_name, drizzle_amount, pixel_fraction):
@@ -574,16 +568,11 @@ class PreprocessingInterface(QMainWindow):
     def seq_bg_extract(self, seq_name):
         """Runs the siril command 'seqsubsky' to extract the background from the plate solved files."""
         try:
-            self.siril.cmd(
-                "seqsubsky",
-                seq_name,
-                "1",
-                "-samples=10",
-            )
+            self.siril.cmd("seqsubsky", seq_name, "1", "-samples=10", )
             self.siril.cmd("cd", ".")  # Refresh current directory
-            self.siril.cmd("close")  # Close and reopen to flush cache
+            self.siril.cmd("close")    # Close and reopen to flush cache
             self.siril.cmd("cd", ".")  # Re-establish working directory
-            time.sleep(10)  # Wait for Siril to flush cache
+            time.sleep(10)          # Wait for Siril to flush cache
         except (s.DataError, s.CommandError, s.SirilError) as e:
             self.siril.log(f"Seq BG Extraction failed: {e}", LogColor.RED)
             self.close_dialog()
@@ -664,7 +653,7 @@ class PreprocessingInterface(QMainWindow):
 
         for idx, filename in enumerate(sorted(os.listdir(folder))):
             if filename.startswith(seq_name) and filename.lower().endswith(
-                self.fits_extension + ".fz"
+                self.fits_extension+".fz"
             ):
                 filepath = os.path.join(folder, filename)
                 try:
@@ -824,7 +813,7 @@ class PreprocessingInterface(QMainWindow):
             self.siril.log(f"Command execution failed: {e}", LogColor.RED)
             self.close_dialog()
 
-        if self.chosen_telescope.endswith("eVscope 1"):
+        if "eVscope 1" in self.chosen_telescope:
             # crop files for evscope1/equinox1 IMX224
             cmd_args = ["seqcrop", f"pp_{seq_name}", "7 0 1296 976"]
 
@@ -948,44 +937,45 @@ class PreprocessingInterface(QMainWindow):
         catalog="localgaia",
         whiteref="Average Spiral Galaxy",
     ):
-        if oscsensor == "Unistellar Evscope 2":
-            self.siril.cmd("pcc", f"-catalog={catalog}")
-            self.siril.log(
-                "PCC'd Image, SPCC Unavailable for Evscope 2", LogColor.GREEN
-            )
+
+        recoded_sensor = oscsensor
+        """SPCC with oscsensor, filter, catalog, and whiteref."""
+        if oscsensor in ["Dwarf 3"]:
+            recoded_sensor = "Sony IMX678"
+        elif "eVscope 1" in oscsensor:
+            recoded_sensor = "Sony IMX224"
+        elif "eVscope 2" in oscsensor:
+            recoded_sensor = "Sony IMX415" # very similar to IMX347
+        elif "Odyssey" in oscsensor:
+            recoded_sensor = "Sony IMX415"
         else:
             recoded_sensor = oscsensor
-            """SPCC with oscsensor, filter, catalog, and whiteref."""
-            if oscsensor in ["Dwarf 3"]:
-                recoded_sensor = "Sony IMX678"
-            else:
-                recoded_sensor = oscsensor
 
-            args = [
-                f"-oscsensor={recoded_sensor}",
-                f"-catalog={catalog}",
-                f"-whiteref={whiteref}",
-            ]
+        args = [
+            f"-oscsensor={recoded_sensor}",
+            f"-catalog={catalog}",
+            f"-whiteref={whiteref}",
+        ]
 
-            # Add filter-specific arguments
-            filter_args = FILTER_COMMANDS_MAP.get(oscsensor, {}).get(filter)
-            if filter_args:
-                args.extend(filter_args)
-            else:
-                # Default to UV/IR Block
-                args.append("-oscfilter=UV/IR Block")
+        # Add filter-specific arguments
+        filter_args = FILTER_COMMANDS_MAP.get(oscsensor, {}).get(filter)
+        if filter_args:
+            args.extend(filter_args)
+        else:
+            # Default to UV/IR Block
+            args.append("-oscfilter=UV/IR Block")
 
-            # Double Quote each argument due to potential spaces
-            quoted_args = [f'"{arg}"' for arg in args]
-            try:
-                self.siril.cmd("spcc", *quoted_args)
-            except (s.CommandError, s.DataError, s.SirilError) as e:
-                self.siril.log(f"SPCC execution failed: {e}", LogColor.RED)
-                self.close_dialog()
+        # Double Quote each argument due to potential spaces
+        quoted_args = [f'"{arg}"' for arg in args]
+        try:
+            self.siril.cmd("spcc", *quoted_args)
+        except (s.CommandError, s.DataError, s.SirilError) as e:
+            self.siril.log(f"SPCC execution failed: {e}", LogColor.RED)
+            self.close_dialog()
 
-            img = self.save_image("_spcc")
-            self.siril.log(f"Saved SPCC'd image: {img}", LogColor.GREEN)
-            return img
+        img = self.save_image("_spcc")
+        self.siril.log(f"Saved SPCC'd image: {img}", LogColor.GREEN)
+        return img
 
     def load_image(self, image_name):
         """Loads the result."""
@@ -1480,21 +1470,18 @@ class PreprocessingInterface(QMainWindow):
         help_button = QPushButton("Help")
         help_button.setMinimumWidth(50)
         help_button.setMinimumHeight(35)
-        # help_button.setStyleSheet("QPushButton { background-color: #6103c7; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #9434fc; }")
         help_button.clicked.connect(self.show_help)
         button_layout.addWidget(help_button)
 
         save_presets_button = QPushButton("Save Presets")
         save_presets_button.setMinimumWidth(80)
         save_presets_button.setMinimumHeight(35)
-        # save_presets_button.setStyleSheet("QPushButton { background-color: #6103c7; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #9434fc; }")
         save_presets_button.clicked.connect(self.save_presets)
         button_layout.addWidget(save_presets_button)
 
         load_presets_button = QPushButton("Load Presets")
         load_presets_button.setMinimumWidth(80)
         load_presets_button.setMinimumHeight(35)
-        # load_presets_button.setStyleSheet("QPushButton { background-color: #6103c7; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #9434fc; }")
         load_presets_button.clicked.connect(self.load_presets)
         button_layout.addWidget(load_presets_button)
 
@@ -1503,9 +1490,6 @@ class PreprocessingInterface(QMainWindow):
         close_button = QPushButton("Close")
         close_button.setMinimumWidth(100)
         close_button.setMinimumHeight(35)
-        close_button.setStyleSheet(
-            "QPushButton { background-color: #c70306; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #fc3437; }"
-        )
         close_button.clicked.connect(self.close_dialog)
         button_layout.addWidget(close_button)
 
@@ -1515,9 +1499,7 @@ class PreprocessingInterface(QMainWindow):
         run_button = QPushButton("Run")
         run_button.setMinimumWidth(100)
         run_button.setMinimumHeight(35)
-        run_button.setStyleSheet(
-            "QPushButton { background-color: #0078cc; color: white; font-weight: bold; border-radius: 4px; } QPushButton:hover { background-color: #33abff; }"
-        )
+        run_button.setStyleSheet("QPushButton { font-weight: bold; }")
         run_button.clicked.connect(self.on_run_clicked)
         button_layout.addWidget(run_button)
 
@@ -1667,7 +1649,7 @@ class PreprocessingInterface(QMainWindow):
                     f"Error during cleanup after calibration: {e}", LogColor.SALMON
                 )
             seq_name = "pp_" + seq_name
-            if self.chosen_telescope.endswith("eVscope 1"):
+            if "eVscope 1" in self.chosen_telescope:
                 seq_name = "cropped_" + seq_name
 
         if bg_extract:
@@ -2057,7 +2039,7 @@ class PreprocessingInterface(QMainWindow):
 
             # Ensure temp folders exist and are empty
             for i in range(num_batches):
-                batch_dir = f"batch_lights{i + 1}"
+                batch_dir = f"batch_lights{i+1}"
                 os.makedirs(batch_dir, exist_ok=True)
                 # Optionally clean out existing files:
                 for f in os.listdir(batch_dir):
@@ -2079,7 +2061,7 @@ class PreprocessingInterface(QMainWindow):
 
             # Send each of the new lights dir into batch directory
             for i in range(num_batches):
-                batch_dir = f"batch_lights{i + 1}"
+                batch_dir = f"batch_lights{i+1}"
                 self.siril.log(f"Processing batch: {batch_dir}", LogColor.BLUE)
                 self.batch(
                     output_name=batch_dir,
@@ -2123,7 +2105,7 @@ class PreprocessingInterface(QMainWindow):
 
             # Clean up temp_lightsX directories
             for i in range(num_batches):
-                batch_dir = f"{batch_lights}{i + 1}"
+                batch_dir = f"{batch_lights}{i+1}"
                 shutil.rmtree(batch_dir, ignore_errors=True)
 
             self.convert_files(final_stack_seq_name)
@@ -2192,10 +2174,10 @@ class PreprocessingInterface(QMainWindow):
         )
         self.siril.log(
             """
-        Thank you for using the Naztronomy Smart Telescope Preprocessor!
+        Thank you for using the Naztronomy Smart Telescope Preprocessor! 
         The author of this script is Nazmus Nasir (Naztronomy).
-        Website: https://www.Naztronomy.com
-        YouTube: https://www.YouTube.com/Naztronomy
+        Website: https://www.Naztronomy.com 
+        YouTube: https://www.YouTube.com/Naztronomy 
         Discord: https://discord.gg/yXKqrawpjr
         Patreon: https://www.patreon.com/c/naztronomy
         Buy me a Coffee: https://www.buymeacoffee.com/naztronomy
