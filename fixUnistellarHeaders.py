@@ -33,14 +33,16 @@ except SirilConnectionError as e:
     print(f"Connection failed: {e}")
 
 for file in os.listdir(siril.get_siril_wd()):
-    if file.endswith(".fits") or file.endswith(".fit"):
+    if not file.startswith(".") and ( file.endswith(".fits") or file.endswith(".fit") ):
+        print("Fixing "+file)
         data, hdr = fits.getdata(file, header=True)
-        hdr.set(
-            "RA", hdr["FOVRA"]
-        )  # add a RA header based on the FOVRA unistellar header
-        hdr.set(
-            "DEC", hdr["FOVDEC"]
-        )  # add a DEC header based on the FOVDEC unistellar header
+        if hdr.get("FOVRA") is not None:
+            hdr.set(
+                "RA", hdr["FOVRA"]
+            )  # add a RA header based on the FOVRA unistellar header
+            hdr.set(
+                "DEC", hdr["FOVDEC"]
+            )  # add a DEC header based on the FOVDEC unistellar header
         telescope = None
         if hdr["INSTRUME"].startswith("IMX224"):  # eVscope1 or eQuinox1
             hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
@@ -57,13 +59,13 @@ for file in os.listdir(siril.get_siril_wd()):
             hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
             hdr.set("YPIXSZ", 1.45)  # add a YPIXSZ header
 
-        if hdr["SOFTVER"].startswith("4.2"):  # fix for bayer issue with latest FW 4.2
+        if hdr.get("SOFTVER") is not None and hdr["SOFTVER"].startswith("4.2"):  # fix for bayer issue with latest FW 4.2
             hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
             hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
         elif telescope is not None:
             hdr.set("TELESCOP", telescope)  # add a TELESCOP header for older FW version
 
         fits.writeto(file, data, hdr, overwrite=True)
-        print(file)
+        print(file+" header fixed")
 
 print("Done!")
