@@ -43,6 +43,10 @@ for file in os.listdir(siril.get_siril_wd()):
             hdr.set(
                 "DEC", hdr["FOVDEC"]
             )  # add a DEC header based on the FOVDEC unistellar header
+        if hdr.get("CMOSTEMP") is not None:
+                hdr.set(
+                    "CCDTEMP", hdr["CMOSTEMP"]
+                )  # add a CCDTEMP header based on the CMOSTEMP unistellar header
         telescope = None
         if hdr["INSTRUME"].startswith("IMX224"):  # eVscope1 or eQuinox1
             hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
