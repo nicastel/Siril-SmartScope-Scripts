@@ -63,6 +63,10 @@ for file in os.listdir(siril.get_siril_wd()):
             hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
             hdr.set("YPIXSZ", 1.45)  # add a YPIXSZ header
 
+        # needed by siril to set properly the pixel size of the stacked image
+        hdr.set("XBINNING", 1) # add a XBINNING header
+        hdr.set("YBINNING", 1) # add a YBINNING header
+
         if hdr.get("SOFTVER") is not None and hdr["SOFTVER"].startswith("4.2"):  # fix for bayer issue with latest FW 4.2
             hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
             hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
