@@ -182,7 +182,7 @@ QPushButton#CoffeeButton:hover {
 QComboBox { background-color: #3c3c3c; color: #ffffff; border: 1px solid #555555; padding: 3px; border-radius: 3px; }
 """
 
-VERSION = "1.0.3"
+VERSION = "HxO_1.0"
 # ------------------------------------------------------------------------------
 # VERSION HISTORY
 # ------------------------------------------------------------------------------
@@ -389,6 +389,11 @@ class VeraLuxNBCore:
 
     @staticmethod
     def mix_channels(norm_rgb, mix_r, mix_g, mix_b, quantum_unmix=False, sensor_profile="Generic OSC"):
+        # (faux SHO) using the formula
+        # ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
+        # from
+        # https://thecoldestnights.com/2020/06/pixinsight-dynamic-narrowband-combinations-with-pixelmath/?fbclid=IwAR1_YtLbAGGBoL-N-I7E8vIqsgB4o_mOwOSr-5F7RpXY4zrQzfmsnzB4lYU
+
         """
         Mixes channels based on Ha/OIII contribution.
 
@@ -400,17 +405,25 @@ class VeraLuxNBCore:
             Ha, OIII = VeraLuxNBCore._quantum_unmix_ha_oiii(norm_rgb, coef)
         else:
             Ha = norm_rgb[0]
-            OIII = (norm_rgb[1] + norm_rgb[2]) * 0.5 # Average G/B for OIII
+            OIII = norm_rgb[1]
 
         R_out = Ha * (1.0 - mix_r) + OIII * mix_r
-        G_out = Ha * (1.0 - mix_g) + OIII * mix_g
 
-        #((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
+        # ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
         O = (OIII*65535.0).astype(np.uint16) 
         H = (Ha*65535.0).astype(np.uint16) 
-        B = np.bitwise_xor((O*H),~(O*H)) * H * (1.0 - mix_b) + ~(np.bitwise_xor((O*H),~(O*H))) * O * mix_b
-        B_out = (B/sys.maxsize).astype(np.float32) / 65535.0
+        fake1 = (np.bitwise_xor((O*H),~(O*H))).astype(np.float32) / 65535.0
+        fake2 = (~(np.bitwise_xor((O*H),~(O*H)))).astype(np.float32) / 65535.0
+        G_out = fake1 * H * (1.0 - mix_g) +  fake2 * O * mix_g
+        #G_out = (fake).astype(np.float32) / 65535.0
 
+        G_out = Ha * (1.0 - mix_g) + OIII * mix_g
+
+        B_out = Ha * (1.0 - mix_b) + OIII * mix_b
+
+
+
+        # invert green and blue
         return np.stack([R_out, G_out, B_out])
 
 # =============================================================================
@@ -584,7 +597,7 @@ class AlchemyGUI(QMainWindow):
         left = QVBoxLayout(left_container); left.setContentsMargins(0,0,0,0)
         
         # --- HEADER (Inside Left Column) ---
-        lbl_title = QLabel("VeraLux Alchemy")
+        lbl_title = QLabel("VeraLux Alchemy HxO")
         lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lbl_title.setStyleSheet("font-size: 16pt; font-weight: bold; color: #88aaff; margin-top: 5px;")
         left.addWidget(lbl_title)
