@@ -390,7 +390,9 @@ class VeraLuxNBCore:
     @staticmethod
     def mix_channels(norm_rgb, mix_r, mix_g, mix_b, quantum_unmix=False, sensor_profile="Generic OSC"):
         # (faux SHO) using the formula
-        # ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
+        # R = Ha
+        # G = ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
+        # B = Oiii
         # from
         # https://thecoldestnights.com/2020/06/pixinsight-dynamic-narrowband-combinations-with-pixelmath/?fbclid=IwAR1_YtLbAGGBoL-N-I7E8vIqsgB4o_mOwOSr-5F7RpXY4zrQzfmsnzB4lYU
 
@@ -417,11 +419,9 @@ class VeraLuxNBCore:
         G_out = fake1 * H * (1.0 - mix_g) +  fake2 * O * mix_g
         #G_out = (fake).astype(np.float32) / 65535.0
 
-        G_out = Ha * (1.0 - mix_g) + OIII * mix_g
+        #G_out = Ha * (1.0 - mix_g) + OIII * mix_g
 
         B_out = Ha * (1.0 - mix_b) + OIII * mix_b
-
-
 
         # invert green and blue
         return np.stack([R_out, G_out, B_out])

@@ -40,17 +40,17 @@ split Ha Oiii B
 
 # Renorm OIII to Ha using PixelMath
 pm $Oiii$*mad($Ha$)/mad($Oiii$)-mad($Ha$)/mad($Oiii$)*median($Oiii$)+median($Ha$)
-save Oiii_renorm
+save Oiii_renorm.fits
 
 # Create an extra blue band using PixelMath
 pm "(($Oiii$*$Ha$)^~($Oiii$*$Ha$))*$Ha$ + ~(($Oiii$*$Ha$)^~($Oiii$*$Ha$))*$Oiii$"
-save fakeblue
+save fakeblue.fits
 
 #Create the RGB composite from the split channel files
-rgbcomp -lum=Ha.fit Ha.fit fakeblue.fit Oiii_renorm.fit
+rgbcomp -lum=Ha.fits Ha.fits fakeblue.fits Oiii_renorm.fits
 
 # Load the completed file
-load composed_lrgb.fit
+load composed_lrgb.fits
 
 #Remove green noise
 rmgreen
@@ -58,7 +58,7 @@ rmgreen
 #Increase global saturation
 satu 1 0
 
-Save HXO_composed_lrgb.fit
+Save HXO_composed_lrgb.fits
 
 ######################################################################
 #   ___                 ____                    ___       __         #
