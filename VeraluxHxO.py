@@ -388,7 +388,7 @@ class VeraLuxNBCore:
         return HA, OIII
 
     @staticmethod
-    def mix_channels(norm_rgb, mix_r, mix_g, mix_b, quantum_unmix=False, sensor_profile="Generic OSC"):
+    def mix_channels(base_rgb, norm_rgb, mix_r, mix_g, mix_b, quantum_unmix=False, sensor_profile="Generic OSC"):
         # (faux SHO) using the formula
         # R = Ha
         # G = ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
@@ -404,26 +404,30 @@ class VeraLuxNBCore:
         """
         if quantum_unmix:
             coef = QUANTUM_COEFFS.get(sensor_profile, QUANTUM_COEFFS.get("Generic OSC"))
-            Ha, OIII = VeraLuxNBCore._quantum_unmix_ha_oiii(norm_rgb, coef)
+            Ha_norm, OIII_norm = VeraLuxNBCore._quantum_unmix_ha_oiii(norm_rgb, coef)
+            Ha = base_rgb[0]
+            OIII = base_rgb[1]            
         else:
-            Ha = norm_rgb[0]
-            OIII = norm_rgb[1]
+            Ha_norm = norm_rgb[0]
+            OIII_norm = norm_rgb[1]
+            Ha = base_rgb[0]
+            OIII = base_rgb[1]
 
-        R_out = Ha * (1.0 - mix_r) + OIII * mix_r
+        R_out = Ha_norm * (1.0 - mix_r) + OIII_norm * mix_r
 
         # ((Oiii*Ha)^~(Oiii*Ha))*Ha + ~((Oiii*Ha)^~(Oiii*Ha))*Oiii
         O = (OIII*65535.0).astype(np.uint16) 
         H = (Ha*65535.0).astype(np.uint16) 
-        fake1 = (np.bitwise_xor((O*H),~(O*H))).astype(np.float32) / 65535.0
-        fake2 = (~(np.bitwise_xor((O*H),~(O*H)))).astype(np.float32) / 65535.0
-        G_out = fake1 * H * (1.0 - mix_g) +  fake2 * O * mix_g
+        fake_coeff = (np.bitwise_xor((O*H),~(O*H))).astype(np.float32) / 65535.0
+        #G_out = fake_coeff * Ha * (1.0 - mix_g) +  (1 - fake_coeff) * OIII_norm * mix_g
+        G_out = fake_coeff * Ha  +  (1 - fake_coeff) * OIII
+        
         #G_out = (fake).astype(np.float32) / 65535.0
 
         #G_out = Ha * (1.0 - mix_g) + OIII * mix_g
 
-        B_out = Ha * (1.0 - mix_b) + OIII * mix_b
+        B_out = Ha_norm * (1.0 - mix_b) + OIII_norm * mix_b
 
-        # invert green and blue
         return np.stack([R_out, G_out, B_out])
 
 # =============================================================================
@@ -539,6 +543,7 @@ class NormalizationWorker(QThread):
 
         # After unmixing, we already have Ha in R and OIII in G/B, so mix in classic mode.
         linear_out = VeraLuxNBCore.mix_channels(
+            base_rgb,
             norm_rgb,
             self.p['mix_r'],
             self.p['mix_g'],
@@ -891,8 +896,8 @@ class AlchemyGUI(QMainWindow):
             )
 
             # 3. Mix Full Res (classic mode; Ha in R, OIII in G/B)
-            final_linear = VeraLuxNBCore.mix_channels(
-                norm_rgb, p['mix_r'], p['mix_g'], p['mix_b'], quantum_unmix=False
+            final_linear = VeraLuxNBCore.mix_channels( 
+                base_rgb, norm_rgb, p['mix_r'], p['mix_g'], p['mix_b'], quantum_unmix=False
             )
             
             # 4. Auto-save (Siril Native I/O)
