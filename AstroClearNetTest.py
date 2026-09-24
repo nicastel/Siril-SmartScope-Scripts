@@ -283,84 +283,104 @@ class SpatialMoffatInterpolator:
 # =====================================================================
 # 4. BOUCLE D'OPTIMISATION DE TUILE UNIQUE
 # =====================================================================
-def optimize_astro_tile(observed_exposures_lr, psf_kernels_hr, scale_factor=2, 
-                        gain=2.1, read_noise=4.5, tv_weight=1e-5, photo_weight=1e-3, 
-                        l1_weight=1e-6, bg_degree=2, bg_l2_weight=1e-3, 
-                        psf_anchor_weight=1.0, iterations=1000):
-    """Optimise de manière auto-supervisée (DIP) une tuile sur le GPU détecté."""
+def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_factor=2, 
+                                batch_size=16, iterations=1000, **kwargs):
+    """
+    Version optimisée pour la VRAM avec mini-batch temporel.
+    batch_size: Nombre maximal de fichiers envoyés simultanément au GPU (ex: 16 ou 32).
+    """
+    device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
     
-    # 1. Sélection dynamique du processeur (Priorité au GPU)
-    if torch.cuda.is_available():
-        device = torch.device("cuda")
-    elif torch.backends.mps.is_available():
-        device = torch.device("mps")
-    else:
-        device = torch.device("cpu")
-        
-    print(f"⚙️ Optimisation de la tuile sur le processeur : {device}")
-
-    # 2. Nettoyage des dimensions unitaires de l'image d'entrée
+    # 1. On nettoie les dimensions pour obtenir la forme brute [Num_Frames, 1, H, W]
     if observed_exposures_lr.dim() == 5:
         observed_exposures_lr = observed_exposures_lr.squeeze(0).squeeze(0)
     if observed_exposures_lr.dim() == 3:
         observed_exposures_lr = observed_exposures_lr.unsqueeze(1)
         
-    # 3. TRANSFERT OBLIGATOIRE des images brutes sur le GPU
-    observed_exposures_lr = observed_exposures_lr.to(device)
-    
+    num_total_frames = observed_exposures_lr.shape[0]
     H_lr, W_lr = observed_exposures_lr.shape[-2:]
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     
-    # 4. TRANSFERT OBLIGATOIRE du réseau et du modèle physique sur le GPU
+    # 2. Initialisation des modèles sur le GPU
     net = AstroDIPBackbone().to(device)
-    forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, bg_degree).to(device)
-    
-    # 5. TRANSFERT OBLIGATOIRE du vecteur de bruit initial sur le GPU
+    # Note: On initialise le modèle d'observation complet
+    forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, kwargs.get('bg_degree', 2)).to(device)
     fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.1
     
-    # 6. L'optimiseur doit pointer sur les paramètres déjà présents sur le GPU
     optimizer = torch.optim.Adam([
         {'params': net.parameters(), 'lr': 0.01},
         {'params': forward_model.bg_model_hr.parameters(), 'lr': 0.005},
         {'params': forward_model.shifts, 'lr': 0.02}
     ])
-
     
-    base_data_loss = AstroMixedNoiseLoss(gain=gain, read_noise=read_noise)
+    # Criteres de perte
+    base_data_loss = AstroMixedNoiseLoss(gain=kwargs.get('gain', 2.1), read_noise=kwargs.get('read_noise', 4.5))
     dni_data_criterion = AstroDynamicInvalidationLoss(base_criterion=base_data_loss, start_iter=300)
-    tv_criterion = TotalVariationLoss(weight=tv_weight)
-    photo_criterion = AstroPhotometryConservationLoss(weight=photo_weight, patch_size=32 * scale_factor)
-    sparsity_criterion = AstroSparsityL1Loss(weight_pixel=l1_weight, weight_gradient=l1_weight)
-    bg_l2_criterion = PolynomialL2Regularization(weight=bg_l2_weight)
+    tv_criterion = TotalVariationLoss(weight=kwargs.get('tv_weight', 1e-5))
+    photo_criterion = AstroPhotometryConservationLoss(weight=kwargs.get('photo_weight', 1e-3), patch_size=32 * scale_factor)
+    sparsity_criterion = AstroSparsityL1Loss(weight_pixel=kwargs.get('l1_weight', 1e-6), weight_gradient=1e-6)
+    bg_l2_criterion = PolynomialL2Regularization(weight=kwargs.get('bg_l2_weight', 1e-3))
     
-    progress_bar = tqdm(range(iterations), desc="   ↳ Itérations DIP", leave=False)
+    from tqdm import tqdm
+    progress_bar = tqdm(range(iterations), desc="   ↳ Itérations DIP (Batched)", leave=False)
     
     for step in progress_bar:
         optimizer.zero_grad()
+        
+        # --- MÉCANISME DE BATCH VRAM ---
+        # Tirage au sort de indices d'images pour cette itération spécifique
+        if num_total_frames > batch_size:
+            indices_batch = torch.randperm(num_total_frames)[:batch_size]
+        else:
+            indices_batch = torch.arange(num_total_frames)
+            
+        # Extraction locale et transfert GPU ultra-ciblé (uniquement la taille du batch)
+        batch_obs_lr = observed_exposures_lr[indices_batch].to(device)
+        
+        # Image Haute Résolution partagée générée par le DIP
         latent_z_hr = net(fixed_noise_input_hr)
+        
+        # 3. Passage direct modifié pour ne calculer le modèle physique QUE sur le batch tiré
+        # Pour ce faire, on adapte temporairement les buffers du forward_model aux indices sélectionnés
+        backup_psfs = forward_model.psfs_hr
+        backup_shifts = forward_model.shifts
+        
+        forward_model.psfs_hr = forward_model.psfs_hr[indices_batch]
+        forward_model.shifts = nn.Parameter(forward_model.shifts[indices_batch])
+        forward_model.num_frames = len(indices_batch)
+        
+        # Calcul des prédictions (Limité à la taille du batch, économie VRAM drastique !)
         predicted_lr, bg_hr = forward_model(latent_z_hr)
         
-        loss_data = dni_data_criterion(predicted_lr, observed_exposures_lr, step)
+        # 4. Calcul des pertes sur le batch actif
+        loss_data = dni_data_criterion(predicted_lr, batch_obs_lr, step)
         loss_tv = tv_criterion(latent_z_hr)
-        loss_photo = photo_criterion(latent_z_hr, observed_exposures_lr)
+        loss_photo = photo_criterion(latent_z_hr, batch_obs_lr)
         loss_l1 = sparsity_criterion(latent_z_hr)
         loss_bg_l2 = bg_l2_criterion(forward_model.bg_model_hr.coefficients)
-        loss_anchor = psf_anchor_weight * torch.mean(forward_model.shifts ** 2)
+        loss_anchor = kwargs.get('psf_anchor_weight', 1.0) * torch.mean(forward_model.shifts ** 2)
         
         total_loss = loss_data + loss_tv + loss_photo + loss_l1 + loss_bg_l2 + loss_anchor
         total_loss.backward()
+        
+        # 5. Restauration des tenseurs globaux pour appliquer la mise à jour de l'optimiseur global
+        with torch.no_grad():
+            # On réinjecte les gradients calculés sur le batch dans les vrais paramètres globaux
+            backup_shifts.grad = torch.zeros_like(backup_shifts)
+            backup_shifts.grad[indices_batch] = forward_model.shifts.grad
+            
+        forward_model.psfs_hr = backup_psfs
+        forward_model.shifts = backup_shifts
+        forward_model.num_frames = num_total_frames
+        
         optimizer.step()
         
         with torch.no_grad():
-            forward_model.shifts.data[0, :] = 0.0
+            forward_model.shifts.data[0, :] = 0.0 # Maintien de l'ancre géométrique
             
-        # Mise à jour des informations textuelles à droite de la barre toutes les 10 itérations
         if step % 10 == 0:
-            progress_bar.set_postfix({
-                "Loss": f"{total_loss.item():.4f}",
-                "Data": f"{loss_data.item():.4f}"
-            })
-
+            progress_bar.set_postfix({"Loss": f"{total_loss.item():.4f}"})
+            
     with torch.no_grad():
         final_sky_hr = net(fixed_noise_input_hr)
         _, final_bg_hr = forward_model(final_sky_hr)
@@ -458,7 +478,7 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             
     # Fermeture propre du compteur à la fin de la boucle
     global_progress.close()
-    
+
     final_sky = (global_sky_hr / (weight_accumulator_hr + 1e-8)).squeeze().numpy()
     final_bg = (global_bg_hr / (weight_accumulator_hr + 1e-8)).squeeze().numpy()
     final_mask = global_mask_lr.numpy()
