@@ -4,7 +4,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+import sirilpy as s
+
+s.ensure_installed("astropy")
 from astropy.io import fits
+
+s.ensure_installed("tqdm")
+from tqdm import tqdm
 
 # =====================================================================
 # 1. COMPOSANTS DE L'ARCHITECTURE (BACKBONE & MODELES PHYSIQUES)
@@ -326,7 +333,9 @@ def optimize_astro_tile(observed_exposures_lr, psf_kernels_hr, scale_factor=2,
     sparsity_criterion = AstroSparsityL1Loss(weight_pixel=l1_weight, weight_gradient=l1_weight)
     bg_l2_criterion = PolynomialL2Regularization(weight=bg_l2_weight)
     
-    for step in range(iterations):
+    progress_bar = tqdm(range(iterations), desc="   ↳ Itérations DIP", leave=False)
+    
+    for step in progress_bar:
         optimizer.zero_grad()
         latent_z_hr = net(fixed_noise_input_hr)
         predicted_lr, bg_hr = forward_model(latent_z_hr)
@@ -343,8 +352,15 @@ def optimize_astro_tile(observed_exposures_lr, psf_kernels_hr, scale_factor=2,
         optimizer.step()
         
         with torch.no_grad():
-            forward_model.shifts.data[0, :] = 0.0 # Verrouillage strict de l'ancre
+            forward_model.shifts.data[0, :] = 0.0
             
+        # Mise à jour des informations textuelles à droite de la barre toutes les 10 itérations
+        if step % 10 == 0:
+            progress_bar.set_postfix({
+                "Loss": f"{total_loss.item():.4f}",
+                "Data": f"{loss_data.item():.4f}"
+            })
+
     with torch.no_grad():
         final_sky_hr = net(fixed_noise_input_hr)
         _, final_bg_hr = forward_model(final_sky_hr)
@@ -395,46 +411,54 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
 
     stride_lr = tile_size - overlap
 
-    for y in range(0, H_lr, stride_lr):
-        for x in range(0, W_lr, stride_lr):
+ # 1. Calcul préalable du nombre total de tuiles pour calibrer le compteur
+    steps_y = list(range(0, H_lr, stride_lr))
+    steps_x = list(range(0, W_lr, stride_lr))
+    total_tuiles = len(steps_y) * len(steps_x)
+    
+    print(f"🧩 Découpage de l'image en {total_tuiles} tuiles...")
+    
+    # 2. Création de la barre de progression principale
+    global_progress = tqdm(total=total_tuiles, desc="🚀 Progression AstroClearNet")
+
+    for y in steps_y:
+        for x in steps_x:
             y_start = min(y, H_lr - tile_size)
-            x_start = min(x, W_lr - tile_size)
             y_end = y_start + tile_size
+            x_start = min(x, W_lr - tile_size)
             x_end = x_start + tile_size
             
-            # 1. Extraction correcte de la tuile en Hauteur ET en Largeur
-            # On applique [..., y_start:y_end, x_start:x_end] sur les deux derniers axes spatiaux
             tile_lr = observed_exposures[..., y_start:y_end, x_start:x_end]
-
-            # 2. Appel du Star Finder (qui recevra cette fois une tuile bien carrée de 512x512)
             density, has_stars, tile_mask = star_finder(tile_lr)
-
-            # 3. Mise à jour du masque global (les dimensions de 'tile_mask.squeeze()' seront maintenant de 512x512)
+            
             global_mask_lr[y_start:y_end, x_start:x_end] = torch.max(
-                global_mask_lr[y_start:y_end, x_start:x_end], 
-                tile_mask.squeeze()
+                global_mask_lr[y_start:y_end, x_start:x_end], tile_mask.squeeze()
             )
-
             
             y_center, x_center = y_start + (tile_size // 2), x_start + (tile_size // 2)
             psf_kernels_hr_local = psf_interpolator(y_center, x_center)
             
             anchor_w = 1.0 if has_stars else 1000.0
-            status_text = "Riche" if has_stars else "Vide/Diffuse (PSF Ancrée)"
-            print(f"-> Traitement Tuile LR [{y_start}:{y_end}, {x_start}:{x_end}] | Statut: {status_text} | Densité: {density:.4f}")
             
+            # Optimisation de la tuile active (qui va afficher sa propre sous-barre d'itérations)
             tile_sky_hr, tile_bg_hr = optimize_astro_tile(
                 tile_lr, psf_kernels_hr_local, scale_factor=scale_factor,
                 psf_anchor_weight=anchor_w, iterations=iterations
             )
             
+            # ... [Logique d'accumulation inchangée] ...
             y_start_hr, y_end_hr = y_start * scale_factor, y_end * scale_factor
             x_start_hr, x_end_hr = x_start * scale_factor, x_end * scale_factor
-            
             global_sky_hr[:, :, y_start_hr:y_end_hr, x_start_hr:x_end_hr] += tile_sky_hr * w_tile_hr
             global_bg_hr[:, :, y_start_hr:y_end_hr, x_start_hr:x_end_hr] += tile_bg_hr * w_tile_hr
             weight_accumulator_hr[:, :, y_start_hr:y_end_hr, x_start_hr:x_end_hr] += w_tile_hr
-
+            
+            # 3. Avancement d'un pas sur le compteur global à chaque tuile terminée
+            global_progress.update(1)
+            
+    # Fermeture propre du compteur à la fin de la boucle
+    global_progress.close()
+    
     final_sky = (global_sky_hr / (weight_accumulator_hr + 1e-8)).squeeze().numpy()
     final_bg = (global_bg_hr / (weight_accumulator_hr + 1e-8)).squeeze().numpy()
     final_mask = global_mask_lr.numpy()
