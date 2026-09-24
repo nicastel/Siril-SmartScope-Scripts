@@ -461,7 +461,7 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             anchor_w = 1.0 if has_stars else 1000.0
             
             # Optimisation de la tuile active (qui va afficher sa propre sous-barre d'itérations)
-            tile_sky_hr, tile_bg_hr = optimize_astro_tile(
+            tile_sky_hr, tile_bg_hr = optimize_astro_tile_batched(
                 tile_lr, psf_kernels_hr_local, scale_factor=scale_factor,
                 psf_anchor_weight=anchor_w, iterations=iterations
             )
