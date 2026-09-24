@@ -211,11 +211,25 @@ class AstroStarFinder(nn.Module):
 
     @torch.no_grad()
     def forward(self, tile_lr):
-        mean_frame = torch.mean(tile_lr, dim=0, keepdim=True)
+        # 1. On extrait la hauteur et la largeur à partir des deux derniers index
+        height, width = tile_lr.shape[-2], tile_lr.shape[-1]
+        
+        # 2. On aplatit toutes les dimensions de tête pour fusionner les batchs/canaux/frames
+        # Le tenseur devient temporairement de taille [Nombre_Total_De_Frames, height, width]
+        flattened_frames = tile_lr.view(-1, height, width)
+        
+        # 3. On calcule la moyenne sur l'axe des frames (dim=0) -> donne une matrice 2D [height, width]
+        mean_frame = torch.mean(flattened_frames, dim=0, keepdim=False)
+        
+        # 4. On reconstruit artificiellement un tenseur 4D parfait [1, 1, height, width] pour F.conv2d
+        mean_frame = mean_frame.unsqueeze(0).unsqueeze(0)
+        
+        # L'opération de convolution reçoit maintenant une structure garantie à 4D
         high_freq = F.conv2d(mean_frame, self.kernel, padding=1)
         sigma = 1.4826 * torch.median(torch.abs(high_freq - torch.median(high_freq)))
         star_mask = (high_freq > (torch.median(high_freq) + self.sigma_thresh * sigma)).float()
         num_pixels = torch.sum(star_mask).item()
+        
         return num_pixels / star_mask.numel(), num_pixels >= self.min_star_pixels, star_mask
 
 # =====================================================================
