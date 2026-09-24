@@ -170,10 +170,29 @@ class AstroPhotometryConservationLoss(nn.Module):
         self.patch_size = patch_size
 
     def forward(self, latent_z, observed_exposures):
-        mean_observed_frame = torch.mean(observed_exposures, dim=0, keepdim=True)
+        # 1. Extraction de la géométrie de la tuile d'exposition
+        height_lr, width_lr = observed_exposures.shape[-2], observed_exposures.shape[-1]
+        height_hr, width_hr = latent_z.shape[-2], latent_z.shape[-1]
+        
+        # Déduction dynamique du scale_factor (ex: 1024 / 512 = 2)
+        scale_factor = height_hr // height_lr
+        
+        # 2. Écrabouillage des dimensions pour générer l'image LR moyenne en 4D strict
+        flattened_frames = observed_exposures.view(-1, height_lr, width_lr)
+        mean_frame_2d = torch.mean(flattened_frames, dim=0, keepdim=False)
+        mean_observed_frame = mean_frame_2d.unsqueeze(0).unsqueeze(0)
+        
+        # 3. Perte de Flux Globale
         global_loss = F.mse_loss(torch.sum(latent_z), torch.sum(mean_observed_frame))
-        local_flux_latent = F.avg_pool2d(latent_z, kernel_size=self.patch_size, stride=self.patch_size)
+        
+        # 4. Ajustement géométrique des patchs pour compenser la Super-Résolution
+        # Le pool HR utilise un kernel deux fois plus grand pour correspondre à la taille physique du pool LR
+        patch_size_hr = self.patch_size * scale_factor
+        
+        local_flux_latent = F.avg_pool2d(latent_z, kernel_size=patch_size_hr, stride=patch_size_hr)
         local_flux_observed = F.avg_pool2d(mean_observed_frame, kernel_size=self.patch_size, stride=self.patch_size)
+        
+        # 5. Calcul final de la perte sans erreur de broadcasting
         return self.weight * (global_loss + F.mse_loss(local_flux_latent, local_flux_observed))
 
 
@@ -263,8 +282,18 @@ def optimize_astro_tile(observed_exposures_lr, psf_kernels_hr, scale_factor=2,
                         psf_anchor_weight=1.0, iterations=1000):
     """Optimise de manière auto-supervisée (DIP) une tuile de l'image globale."""
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    observed_exposures_lr = observed_exposures_lr.to(device)
     
+    # CORRECTION : Si le tenseur arrive en 5D [1, 1, Num_Frames, H, W],
+    # on supprime les deux premières dimensions unitaires pour obtenir [Num_Frames, H, W]
+    if observed_exposures_lr.dim() == 5:
+        observed_exposures_lr = observed_exposures_lr.squeeze(0).squeeze(0)
+    
+    # On s'assure qu'il possède bien le canal de taille 1 pour faire [Num_Frames, 1, H, W]
+    if observed_exposures_lr.dim() == 3:
+        observed_exposures_lr = observed_exposures_lr.unsqueeze(1)
+        
+    observed_exposures_lr = observed_exposures_lr.to(device)
+
     H_lr, W_lr = observed_exposures_lr.shape[-2:]
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     
@@ -361,12 +390,19 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             y_end = y_start + tile_size
             x_end = x_start + tile_size
             
-            tile_lr = observed_exposures[:, :, y_start:y_end, x_start:x_end]
+            # 1. Extraction correcte de la tuile en Hauteur ET en Largeur
+            # On applique [..., y_start:y_end, x_start:x_end] sur les deux derniers axes spatiaux
+            tile_lr = observed_exposures[..., y_start:y_end, x_start:x_end]
+
+            # 2. Appel du Star Finder (qui recevra cette fois une tuile bien carrée de 512x512)
             density, has_stars, tile_mask = star_finder(tile_lr)
-            
+
+            # 3. Mise à jour du masque global (les dimensions de 'tile_mask.squeeze()' seront maintenant de 512x512)
             global_mask_lr[y_start:y_end, x_start:x_end] = torch.max(
-                global_mask_lr[y_start:y_end, x_start:x_end], tile_mask.squeeze()
+                global_mask_lr[y_start:y_end, x_start:x_end], 
+                tile_mask.squeeze()
             )
+
             
             y_center, x_center = y_start + (tile_size // 2), x_start + (tile_size // 2)
             psf_kernels_hr_local = psf_interpolator(y_center, x_center)
@@ -421,7 +457,20 @@ def main():
     nombre_iterations = 1200
     
     print("🔭 --- DÉMARRAGE DU PIPELINE ASTROCLEARNET (SR x2) ---")
-    
+
+    def get_astro_device():
+        """Retourne le meilleur processeur disponible pour l'optimisation."""
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            return torch.device("mps")
+        else:
+            return torch.device("cpu")
+
+    # Utilisation dans vos fonctions :
+    device = get_astro_device()
+    print(f"🚀 AstroClearNet s'exécute sur le processeur : {device}")
+
     # 2. Collecte automatique des fichiers FITS présents dans le dossier
     fichiers_cibles = [
         os.path.join(repertoire_donnees, f) 
