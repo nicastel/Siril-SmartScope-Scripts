@@ -126,6 +126,42 @@ class AstroSRDitheringObservationModel(nn.Module):
 # 2. FONCTIONS DE PERTE ET RECONNAISSANCE D'ÉTOILES
 # =====================================================================
 
+class AstroFWHMEstimator(nn.Module):
+    """
+    Estime rapidement la FWHM (Full Width at Half Maximum) moyenne
+    des étoiles détectées sur l'image haute résolution (HR) pour le Early Stopping.
+    """
+    def __init__(self):
+        super(AstroFWHMEstimator, self).__init__()
+
+    @torch.no_grad()
+    def forward(self, latent_z_hr, star_mask_lr, scale_factor=2):
+        """
+        latent_z_hr: [1, 1, H_hr, W_hr]
+        star_mask_lr: [1, 1, H_lr, W_lr]
+        """
+        # Interpoler le masque d'étoiles à l'échelle Haute Résolution (HR)
+        star_mask_hr = F.interpolate(star_mask_lr, scale_factor=scale_factor, mode='nearest')
+        
+        # Isoler les étoiles du fond du ciel
+        stars_only = latent_z_hr * star_mask_hr
+        
+        # Trouver la valeur maximale locale de chaque étoile (approximation via les pics)
+        max_val = torch.max(stars_only)
+        if max_val <= 1e-5:
+            return 99.0 # Valeur par défaut si aucune étoile n'est présente
+            
+        # Calculer le niveau de flux à mi-hauteur (Half Maximum)
+        half_max = max_val / 2.0
+        
+        # Compter le nombre de pixels qui dépassent la mi-hauteur au sein du masque
+        fwhm_pixels = torch.sum((stars_only >= half_max) & (star_mask_hr > 0)).item()
+        num_stars_regions = torch.sum(star_mask_hr).item() + 1e-8
+        
+        # La FWHM géométrique est proportionnelle à la racine carrée de la surface du pic
+        fwhm_estimate = 2.0 * math.sqrt(fwhm_pixels / num_stars_regions)
+        return fwhm_estimate
+
 class AstroMixedNoiseLoss(nn.Module):
     def __init__(self, gain=1.0, read_noise=0.0):
         super(AstroMixedNoiseLoss, self).__init__()
@@ -324,35 +360,40 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     from tqdm import tqdm
     progress_bar = tqdm(range(iterations), desc="   ↳ Itérations DIP (Batched)", leave=False)
     
+    # --- Remplacer la boucle d'optimisation dans votre fonction optimize_astro_tile_batched ---
+
+    fwhm_estimator = AstroFWHMEstimator()
+    
+    # Paramètres de Early Stopping
+    meilleure_fwhm = float('inf')
+    patience = 50
+    declenchements_sans_amelioration = 0
+    iteration_arret = iterations
+    
+    # Récupération du masque d'étoiles calculé en amont pour cette tuile (passé via kwargs)
+    star_mask_lr = kwargs.get('tile_mask', torch.ones((1, 1, H_lr, W_lr)))
+
     for step in progress_bar:
         optimizer.zero_grad()
         
-        # --- MÉCANISME DE BATCH VRAM ---
-        # Tirage au sort de indices d'images pour cette itération spécifique
+        # Sélection du batch temporel
         if num_total_frames > batch_size:
             indices_batch = torch.randperm(num_total_frames)[:batch_size]
         else:
             indices_batch = torch.arange(num_total_frames)
             
-        # Extraction locale et transfert GPU ultra-ciblé (uniquement la taille du batch)
         batch_obs_lr = observed_exposures_lr[indices_batch].to(device)
-        
-        # Image Haute Résolution partagée générée par le DIP
         latent_z_hr = net(fixed_noise_input_hr)
         
-        # 3. Passage direct modifié pour ne calculer le modèle physique QUE sur le batch tiré
-        # Pour ce faire, on adapte temporairement les buffers du forward_model aux indices sélectionnés
-        backup_psfs = forward_model.psfs_hr
-        backup_shifts = forward_model.shifts
-        
+        # Sauvegarde et swap des buffers pour le forward model
+        backup_psfs, backup_shifts = forward_model.psfs_hr, forward_model.shifts
         forward_model.psfs_hr = forward_model.psfs_hr[indices_batch]
         forward_model.shifts = nn.Parameter(forward_model.shifts[indices_batch])
         forward_model.num_frames = len(indices_batch)
         
-        # Calcul des prédictions (Limité à la taille du batch, économie VRAM drastique !)
         predicted_lr, bg_hr = forward_model(latent_z_hr)
         
-        # 4. Calcul des pertes sur le batch actif
+        # Pertes
         loss_data = dni_data_criterion(predicted_lr, batch_obs_lr, step)
         loss_tv = tv_criterion(latent_z_hr)
         loss_photo = photo_criterion(latent_z_hr, batch_obs_lr)
@@ -363,24 +404,43 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         total_loss = loss_data + loss_tv + loss_photo + loss_l1 + loss_bg_l2 + loss_anchor
         total_loss.backward()
         
-        # 5. Restauration des tenseurs globaux pour appliquer la mise à jour de l'optimiseur global
+        # Restauration des gradients
         with torch.no_grad():
-            # On réinjecte les gradients calculés sur le batch dans les vrais paramètres globaux
             backup_shifts.grad = torch.zeros_like(backup_shifts)
             backup_shifts.grad[indices_batch] = forward_model.shifts.grad
             
-        forward_model.psfs_hr = backup_psfs
-        forward_model.shifts = backup_shifts
-        forward_model.num_frames = num_total_frames
-        
+        forward_model.psfs_hr, forward_model.shifts, forward_model.num_frames = backup_psfs, backup_shifts, num_total_frames
         optimizer.step()
         
         with torch.no_grad():
-            forward_model.shifts.data[0, :] = 0.0 # Maintien de l'ancre géométrique
+            forward_model.shifts.data[0, :] = 0.0
             
-        if step % 10 == 0:
-            progress_bar.set_postfix({"Loss": f"{total_loss.item():.4f}"})
+        # --- CALCUL ET LOGIQUE DU EARLY STOPPING ---
+        if step >= 150 and step % 5 == 0 and kwargs.get('has_stars', True):
+            fwhm_actuelle = fwhm_estimator(latent_z_hr, star_mask_lr.to(device), scale_factor)
             
+            # Si l'image devient plus piquée (FWHM diminue)
+            if fwhm_actuelle < meilleure_fwhm:
+                meilleure_fwhm = fwhm_actuelle
+                declenchements_sans_amelioration = 0
+            else:
+                declenchements_sans_amelioration += 5
+                
+            # Affichage du monitoring dans la barre de progression
+            progress_bar.set_postfix({
+                "Loss": f"{total_loss.item():.4f}",
+                "FWHM_HR": f"{fwhm_actuelle:.2f}px"
+            })
+            
+            # Condition de coupure prématurée
+            if declenchements_sans_amelioration >= patience:
+                iteration_arret = step
+                break
+        elif step % 10 == 0:
+            progress_bar.set_postfix({"Loss": f"{total_loss.item():.4f}", "FWHM_HR": "Calcul..."})
+
+    print(f"   ↳ 🏁 Fin de la tuile à l'itération {iteration_arret}/{iterations} | Meilleure FWHM HR : {meilleure_fwhm:.2f}px")
+
     with torch.no_grad():
         final_sky_hr = net(fixed_noise_input_hr)
         _, final_bg_hr = forward_model(final_sky_hr)
@@ -462,8 +522,14 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             
             # Optimisation de la tuile active (qui va afficher sa propre sous-barre d'itérations)
             tile_sky_hr, tile_bg_hr = optimize_astro_tile_batched(
-                tile_lr, psf_kernels_hr_local, scale_factor=scale_factor,
-                psf_anchor_weight=anchor_w, iterations=iterations
+                observed_exposures_lr=tile_lr, 
+                psf_kernels_hr=psf_kernels_hr_local, 
+                scale_factor=scale_factor,
+                psf_anchor_weight=anchor_w, 
+                iterations=iterations,
+                batch_size=16,
+                tile_mask=tile_mask,  # TRANSMISSION DU MASQUE UNIQUE DE CETTE TUILE
+                has_stars=has_stars   # PERMET D'IGNORER LE EARLY STOPPING SUR LES TUILES VIDES
             )
             
             # ... [Logique d'accumulation inchangée] ...
