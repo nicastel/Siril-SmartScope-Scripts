@@ -430,6 +430,13 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     declenchements_sans_amelioration = 0
     iteration_arret = iterations
 
+    app = s.SirilInterface()
+    try:
+        app.connect()
+        print("Connected successfully!")
+    except SirilConnectionError as e:
+        print(f"Connection failed: {e}")
+
     for step in progress_bar:
         optimizer.zero_grad()
         
@@ -468,6 +475,25 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
             
         forward_model.psfs_hr, forward_model.shifts, forward_model.num_frames = backup_psfs, backup_shifts, num_total_frames
         optimizer.step()
+
+        # --- EXPORT ET CHARGEMENT AUTOMATIQUE DANS SIRIL ---
+        if step % 50 == 0:
+            with torch.no_grad():
+                preview_sky_hr = net(fixed_noise_input_hr).detach().cpu().squeeze().numpy()
+                hdu_preview = fits.PrimaryHDU(data=preview_sky_hr)
+                
+                # Sauvegarde du fichier temporaire
+                nom_fichier_temp = "clearnet_live.fits"
+                hdu_preview.writeto(nom_fichier_temp, overwrite=True)
+                
+                # ENVOI DE LA COMMANDE À SIRIL VIA PYSIRIL
+                # Si vous avez instancié Siril avec 'app = Siril()', vous l'appelez ainsi :
+                try:
+                    # La commande 'load' force l'interface de Siril à afficher le nouveau FITS
+                    app.cmd(f"load {nom_fichier_temp}")
+                except NameError:
+                    # Sécurité si 'app' n'est pas définie dans cette sous-fonction
+                    pass
         
         with torch.no_grad():
             forward_model.shifts.data[0, :] = 0.0
@@ -636,45 +662,33 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
     
     print("✨ Opération terminée avec succès ! Les fichiers FITS ont été générés.")
 
-
 def main():
-    """
-    Fonction principale orchestrant l'exécution du pipeline AstroClearNet.
-    Fouille le répertoire, prépare les variables et traite le lot d'images.
-    """
-    # 1. Configuration des répertoires et préfixes
     repertoire_donnees = "./"
     prefixe_sortie = "target_field"
     
-    # Paramètres d'exécution
     taille_tuile = 512
     chevauchement = 64
-    nombre_iterations = 1200
+    nombre_iterations = 800  # Calé sur votre optimisation à 800 itérations
     
-    print("🔭 --- DÉMARRAGE DU PIPELINE ASTROCLEARNET (SR x2) ---")
-
-    # 2. Collecte automatique des fichiers FITS présents dans le dossier
+    print("🔭 --- DÉMARRAGE DU PIPELINE ASTROCLEARNET ---")
+    
+    # CORRECTION DU FILTRE : On exclut le préfixe de sortie ET le fichier live temporaire
     fichiers_cibles = [
         os.path.join(repertoire_donnees, f) 
         for f in os.listdir(repertoire_donnees) 
-        if f.endswith('.fits') and not f.startswith(prefixe_sortie)
+        if f.endswith('.fits') 
+        and not f.startswith(prefixe_sortie) 
+        and "clearnet_live" not in f  # <-- Exclusion stricte du fichier preview
     ]
     
-    # Tri alphabétique pour garantir un ordre constant (la première frame sert d'ancre)
     fichiers_cibles.sort()
     
     if len(fichiers_cibles) < 2:
-        print(f"❌ Erreur : Il faut au moins 2 images FITS pour appliquer la Super-Résolution.")
-        print(f"Fichiers trouvés : {len(fichiers_cibles)}. Fin du programme.")
+        print(f"❌ Erreur : Il faut au moins 2 images FITS. Trouvées : {len(fichiers_cibles)}.")
         return
 
-    print(f"✨ {len(fichiers_cibles)} expositions brutes détectées pour le traitement.")
-    for i, path in enumerate(fichiers_cibles):
-        print(f"  [{i}] -> {os.path.basename(path)}")
-        
-    print(f"⚙️ Configuration : Tuiles={taille_tuile}px, Overlap={chevauchement}px, Itérations={nombre_iterations}")
+    print(f"✨ {len(fichiers_cibles)} expositions brutes prêtes pour le traitement.")
     
-    # 3. Exécution sécurisée de la chaîne globale par tuiles
     try:
         run_astro_clearnet_pipeline(
             fits_paths=fichiers_cibles, 
@@ -684,9 +698,8 @@ def main():
             iterations=nombre_iterations
         )
     except Exception as e:
-        print(f"❌ Une erreur critique est survenue durant l'optimisation : {str(e)}")
+        print(f"❌ Erreur critique : {str(e)}")
         raise e
-
 
 if __name__ == "__main__":
     main()
