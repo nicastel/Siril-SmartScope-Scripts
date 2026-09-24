@@ -136,55 +136,64 @@ class AstroFWHMEstimator(nn.Module):
 
     @torch.no_grad()
     def forward(self, latent_z_hr, star_mask_lr, scale_factor=2):
-        # 1. Interpolation et isolation des zones stellaires
-        star_mask_hr = F.interpolate(star_mask_lr, scale_factor=scale_factor, mode='nearest')
-        stars_only = latent_z_hr * star_mask_hr
+        # 1. Isolation de la matrice 2D Haute Résolution propre
+        height_hr, width_hr = latent_z_hr.shape[-2], latent_z_hr.shape[-1]
+        stars_2d = torch.mean(latent_z_hr.view(-1, height_hr, width_hr), dim=0).clone()
         
-        # Extraction en matrices 2D [H, W] propres et isolées
-        height_hr, width_hr = stars_only.shape[-2], stars_only.shape[-1]
-        stars_2d = torch.mean(stars_only.view(-1, height_hr, width_hr), dim=0).clone()
+        # Masque de garde pour éliminer les artefacts de bords de tuiles
+        guard_mask = torch.zeros_like(stars_2d)
+        guard_mask[30:-30, 30:-30] = 1.0
+        stars_masked = stars_2d * guard_mask
         
-        # --- CORRECTION CHIRURGICALE ---
-        # Au lieu d'utiliser le masque large qui englobe du bruit, on ne garde 
-        # QUE les pixels très brillants de la tuile (les pics d'étoiles réels)
-        seuil_etoile = torch.max(stars_2d) * 0.1  # On prend les pixels au-dessus de 10% du pic max
-        if seuil_etoile < 1e-4:
+        # 2. Localisation de la vraie étoile la plus brillante
+        max_val = torch.max(stars_masked)
+        if max_val < 1e-4:
             return 12.0
             
-        # Nouveau masque ultra-restreint aux cœurs des étoiles
-        mask_pics = (stars_2d > seuil_etoile).float()
+        idx_max = torch.argmax(stars_masked)
+        peak_y = int(idx_max // width_hr)
+        peak_x = int(idx_max % width_hr)
         
-        # 2. Sécurité : si la zone est vide
-        if torch.sum(mask_pics) < 5:
-            return 12.0
-            
-        # 3. Extraction des coordonnées locales uniquement sur les pics
-        indices = torch.nonzero(mask_pics > 0, as_tuple=True)
-        y_coords = indices[0].float()
-        x_coords = indices[1].float()
-        weights = stars_2d[indices] + 1e-8
+        # 3. Extraction d'une petite vignette étroite (15x15 pixels)
+        radius = 7
+        y_min = max(0, peak_y - radius)
+        y_max = min(height_hr, peak_y + radius + 1)
+        x_min = max(0, peak_x - radius)
+        x_max = min(width_hr, peak_x + radius + 1)
         
-        # 4. Calcul du centre de gravité local (barycentre du pic)
-        centroid_y = torch.sum(y_coords * weights) / torch.sum(weights)
-        centroid_x = torch.sum(x_coords * weights) / torch.sum(weights)
+        vignette = stars_2d[y_min:y_max, x_min:x_max]
         
-        # 5. Calcul de la variance (écartement réel de la lumière dans le pic)
-        variance_y = torch.sum(((y_coords - centroid_y) ** 2) * weights) / torch.sum(weights)
-        variance_x = torch.sum(((x_coords - centroid_x) ** 2) * weights) / torch.sum(weights)
+        # 4. Grille de coordonnées locales
+        ny, nx = vignette.shape
+        y_grid, x_grid = torch.meshgrid(torch.arange(ny, device=vignette.device), 
+                                        torch.arange(nx, device=vignette.device), indexing='ij')
         
-        # 6. Conversion Variance -> FWHM mathématique brute
-        # On limite le calcul à l'environnement immédiat du pic détecté
-        sigma = torch.sqrt((variance_y + variance_x) / 2.0)
+        # --- CORRECTION DE LA DÉRIVE ---
+        # Soustraction du fond local
+        vignette_sub = torch.clamp(vignette - torch.min(vignette), min=0.0)
         
-        # Correction de l'étalement global de la grille : on s'assure d'évaluer une seule source
-        # Si plusieurs étoiles sont dans la tuile, la variance globale augmente.
-        # Pour une FWHM représentative par pixel, on applique un facteur d'échelle local :
-        fwhm_estimate = 2.355 * (sigma.item() / math.sqrt(torch.sum(mask_pics).item()))
+        # Seuil strict à mi-hauteur (Half-Maximum) local à l'étoile
+        # Tout ce qui est en dessous de 50% de l'intensité du pic est mis à 0.
+        # Cela coupe mathématiquement les fuites de pixels sur les bords du carré de 15x15
+        seuil_hm = torch.max(vignette_sub) * 0.5
+        vignette_clean = torch.where(vignette_sub >= seuil_hm, vignette_sub, torch.zeros_like(vignette_sub))
         
-        # --- VISUALISATION DU DEBUG CORRIGÉ ---
-        print(f" [DEBUG FWHM] Valeur brute corrigée : {fwhm_estimate:.4f} px")
+        total_flux = torch.sum(vignette_clean) + 1e-8
         
-        if fwhm_estimate < 0.5 or fwhm_estimate > 30.0:
+        # 5. Calcul des moments sur l'étoile purement isolée
+        local_cy = torch.sum(y_grid * vignette_clean) / total_flux
+        local_cx = torch.sum(x_grid * vignette_clean) / total_flux
+        
+        var_y = torch.sum(((y_grid - local_cy) ** 2) * vignette_clean) / total_flux
+        var_x = torch.sum(((x_grid - local_cx) ** 2) * vignette_clean) / total_flux
+        
+        # Conversion Variance -> FWHM (FWHM = 2.355 * sigma)
+        sigma = torch.sqrt((var_y + var_x) / 2.0)
+        fwhm_estimate = 2.355 * sigma.item()
+        
+        print(f" [DEBUG FWHM] Mesure locale sur le pic central : {fwhm_estimate:.4f} px")
+        
+        if fwhm_estimate < 1.0 or fwhm_estimate > 20.0:
             return 12.0
             
         return fwhm_estimate
@@ -511,18 +520,26 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
     """Charge l'ensemble des fichiers FITS, applique le découpage par tuiles et exporte les résultats."""
     print(f"📦 Chargement de {len(fits_paths)} fichiers FITS...")
     
+    # --- À REMPLACER DANS run_astro_clearnet_pipeline (Chargement des FITS) ---
     frames = []
     base_header = None
     for path in fits_paths:
-        with fits.open(path) as hdul:
-            hdul.verify('fix')
+        with fits.open(path, memmap=True) as hdul:
             data = hdul[0].data.astype(np.float32)
             if base_header is None:
                 base_header = hdul[0].header
             frames.append(data)
             
+    # Empilement des images
     observed_exposures = torch.tensor(np.stack(frames)).unsqueeze(1)
-    print(observed_exposures.shape)
+    
+    # CORRECTION CRITIQUE : Normalisation globale de la dynamique entre 0.0 et 1.0
+    # Empêche la saturation de la Sigmoid et débloque la descente de gradient
+    valeur_max_pixel = torch.max(observed_exposures)
+    if valeur_max_pixel > 1.0:
+        print(f"⚠️ Pixel max détecté à {valeur_max_pixel.item():.1f} ADU. Normalisation automatique [0, 1] en cours...")
+        observed_exposures = observed_exposures / valeur_max_pixel
+
     N, O, C, H_lr, W_lr = observed_exposures.shape
     
     psf_interpolator = SpatialMoffatInterpolator(num_frames=N, image_shape=(H_lr, W_lr))
