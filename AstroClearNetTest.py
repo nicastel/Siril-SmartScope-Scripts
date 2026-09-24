@@ -136,30 +136,36 @@ class AstroFWHMEstimator(nn.Module):
 
     @torch.no_grad()
     def forward(self, latent_z_hr, star_mask_lr, scale_factor=2):
-        """
-        latent_z_hr: [1, 1, H_hr, W_hr]
-        star_mask_lr: [1, 1, H_lr, W_lr]
-        """
-        # Interpoler le masque d'étoiles à l'échelle Haute Résolution (HR)
+        # 1. Interpolation et isolation des zones stellaires
         star_mask_hr = F.interpolate(star_mask_lr, scale_factor=scale_factor, mode='nearest')
-        
-        # Isoler les étoiles du fond du ciel
         stars_only = latent_z_hr * star_mask_hr
         
-        # Trouver la valeur maximale locale de chaque étoile (approximation via les pics)
-        max_val = torch.max(stars_only)
-        if max_val <= 1e-5:
-            return 99.0 # Valeur par défaut si aucune étoile n'est présente
+        # 2. Sécurité : si la tuile est trop sombre ou le masque vide, on évite la division par zéro
+        if torch.sum(star_mask_hr) < 10 or torch.max(stars_only) < 1e-4:
+            return 8.0 # On renvoie une FWHM d'initialisation standard par défaut
             
-        # Calculer le niveau de flux à mi-hauteur (Half Maximum)
-        half_max = max_val / 2.0
+        # 3. Méthode robuste par Moments Centrés (Variance spatiale du flux)
+        # On extrait les coordonnées des pixels actifs pour mesurer l'étalement réel de la lumière
+        indices = torch.nonzero(star_mask_hr.squeeze() > 0, as_tuple=True)
+        y_coords, x_coords = indices[0].float(), indices[1].float()
+        weights = stars_only.squeeze()[indices] + 1e-8
         
-        # Compter le nombre de pixels qui dépassent la mi-hauteur au sein du masque
-        fwhm_pixels = torch.sum((stars_only >= half_max) & (star_mask_hr > 0)).item()
-        num_stars_regions = torch.sum(star_mask_hr).item() + 1e-8
+        # Calcul du centre de gravité (barycentre) de l'étoile
+        centroid_y = torch.sum(y_coords * weights) / torch.sum(weights)
+        centroid_x = torch.sum(x_coords * weights) / torch.sum(weights)
         
-        # La FWHM géométrique est proportionnelle à la racine carrée de la surface du pic
-        fwhm_estimate = 2.0 * math.sqrt(fwhm_pixels / num_stars_regions)
+        # Calcul de la variance (l'étalement quadratique moyen autour du centre)
+        variance_y = torch.sum(((y_coords - centroid_y) ** 2) * weights) / torch.sum(weights)
+        variance_x = torch.sum(((x_coords - centroid_x) ** 2) * weights) / torch.sum(weights)
+        
+        # Formule de conversion : FWHM = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.355 * sigma
+        sigma = torch.sqrt((variance_y + variance_x) / 2.0)
+        fwhm_estimate = 2.355 * sigma.item()
+        
+        # Nouvelle sécurité pour éviter les valeurs aberrantes induites par le bruit de fond
+        if fwhm_estimate < 1.0 or fwhm_estimate > 30.0:
+            return 6.0
+            
         return fwhm_estimate
 
 class AstroMixedNoiseLoss(nn.Module):
