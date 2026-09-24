@@ -193,7 +193,11 @@ class AstroFWHMEstimator(nn.Module):
         
         print(f" [DEBUG FWHM] Mesure locale sur le pic central : {fwhm_estimate:.4f} px")
         
-        if fwhm_estimate < 1.0 or fwhm_estimate > 20.0:
+        # --- FILTRE DES COMPORTEMENTS ABERRANTS INDUITS PAR LE BRUIT ---
+        # Si fwhm_estimate est trop basse (< 0.8px), c'est un pixel chaud ou un bruit isolé, pas une étoile.
+        # Si elle est trop haute (> 20.0px), c'est une dérive de fond de ciel.
+        # Dans ces deux cas, on renvoie 12.00px pour protéger l'optimiseur.
+        if fwhm_estimate < 0.8 or fwhm_estimate > 20.0:
             return 12.0
             
         return fwhm_estimate
@@ -409,11 +413,50 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     
     # 2. Initialisation des modèles sur le GPU
-    net = AstroDIPBackbone().to(device)
-    # Note: On initialise le modèle d'observation complet
-    forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, kwargs.get('bg_degree', 2)).to(device)
-    fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.1
     
+    # --- ANCIEN CODE INTERROMPU ---
+    # net = AstroDIPBackbone().to(device)
+    # fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.1
+    
+    # --- NOUVELLE INITIALISATION PAR LA MOYENNE BRUTE (WARM-START) ---
+    device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
+    
+    # 1. Calcul de la moyenne temporelle brute de la tuile en cours (Luminance)
+    mean_tile_lr = torch.mean(observed_exposures_lr, dim=0, keepdim=True).to(device) # Shape [1, 1, 512, 512]
+    
+    # 2. Upsampling géométrique x2 pour créer la cible Haute Résolution de départ
+    target_start_hr = F.interpolate(mean_tile_lr, size=(H_hr, W_hr), mode='bilinear', align_corners=False)
+    
+    # 3. Instanciation du réseau et du vecteur d'entrée fixe
+    net = AstroDIPBackbone().to(device)
+    fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.05
+    
+    # 4. PRÉ-ENTRAÎNEMENT FLASH (20 itérations) pour forcer le réseau à reproduire la moyenne brute
+    print("🧠 Pré-initialisation du réseau de neurones sur la moyenne des images brutes...")
+    init_optimizer = torch.optim.Adam(net.parameters(), lr=0.01)
+    for _ in range(25):
+        init_optimizer.zero_grad()
+        prediction_init = net(fixed_noise_input_hr)
+        loss_init = F.mse_loss(prediction_init, target_start_hr)
+        loss_init.backward()
+        init_optimizer.step()
+        
+    print("🟩 Réseau initialisé avec succès ! L'itération 0 contiendra l'image intelligible.")
+
+    # DIAGNOSTIC DE SÉCURITÉ ABSOLUE SUR LE CONTENU DU TENSEUR
+    with torch.no_grad():
+        test_net_out = net(fixed_noise_input_hr).cpu().squeeze().numpy()
+        test_target_hr = target_start_hr.cpu().squeeze().numpy()
+        
+    print(f"🔬 [CHECK ARRAYS] Net Out Shape: {test_net_out.shape} | Min: {test_net_out.min():.4f} | Max: {test_net_out.max():.4f}")
+    print(f"🔬 [CHECK ARRAYS] Target HR Shape: {test_target_hr.shape} | Min: {test_target_hr.min():.4f} | Max: {test_target_hr.max():.4f}")
+    
+    # On force l'export direct de la cible brute calculée avant toute itération
+    fits.writeto("DEBUG_TARGET_PURE.fits", test_target_hr, overwrite=True)
+    fits.writeto("DEBUG_NET_OUT_PURE.fits", test_net_out, overwrite=True)
+    
+    # 5. Instanciation du modèle d'observation final (Le reste de vos variables demeure identique)
+    forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, kwargs.get('bg_degree', 2)).to(device)
     optimizer = torch.optim.Adam([
         {'params': net.parameters(), 'lr': 0.01},
         {'params': forward_model.bg_model_hr.parameters(), 'lr': 0.005},
@@ -469,7 +512,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     try:
         app.connect()
         print("Connected successfully!")
-    except SirilConnectionError as e:
+    except s.exceptions.SirilConnectionError as e:
         print(f"Connection failed: {e}")
 
     for step in progress_bar:
@@ -606,23 +649,46 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             if base_header is None:
                 base_header = hdul[0].header
             frames.append(data)
-            
-    # Empilement des images
-    observed_exposures = torch.tensor(np.stack(frames)).unsqueeze(1)
-    
-    # CORRECTION CRITIQUE : Normalisation globale de la dynamique entre 0.0 et 1.0
-    # Empêche la saturation de la Sigmoid et débloque la descente de gradient
-    valeur_max_pixel = torch.max(observed_exposures)
-    if valeur_max_pixel > 1.0:
-        print(f"⚠️ Pixel max détecté à {valeur_max_pixel.item():.1f} ADU. Normalisation automatique [0, 1] en cours...")
-        observed_exposures = observed_exposures / valeur_max_pixel
-
-    N, O, C, H_lr, W_lr = observed_exposures.shape
-    
-    psf_interpolator = SpatialMoffatInterpolator(num_frames=N, image_shape=(H_lr, W_lr))
-    # 1. Dans l'initialisation de run_astro_clearnet_pipeline, montez le seuil à 8.0
-    star_finder = AstroStarFinder(sigma_thresh=8.0, min_star_pixels=15)
         
+    # 1. Empilement initial des données lues
+    raw_stack = np.stack(frames) # Forme d'origine : [5, 3, 1505, 1704] ou similaire
+    observed_exposures = torch.tensor(raw_stack, dtype=torch.float32)
+    
+    # Si le tenseur a été enveloppé avec un canal unitaire en position 1 [5, 1, 3, 1505, 1704]
+    if observed_exposures.dim() == 5 and observed_exposures.shape[2] == 3:
+        # On supprime le canal unitaire fantôme pour récupérer [5, 3, 1505, 1704]
+        observed_exposures = observed_exposures.squeeze(1)
+
+    # --- REDRESSEMENT ET TRANSPOSITION GÉOMÉTRIQUE STRICTE ---
+    if observed_exposures.dim() == 4 and observed_exposures.shape[1] == 3:
+        print("🌈 Extraction de la luminance et redressement des axes géométriques FITS...")
+        # 1. Calcul de la luminance (Monochrome noir et blanc)
+        r = observed_exposures[:, 0:1, :, :]
+        g = observed_exposures[:, 1:2, :, :]
+        b = observed_exposures[:, 2:3, :, :]
+        observed_exposures = 0.299 * r + 0.587 * g + 0.114 * b
+        
+        # 2. CORRECTION DU DÉCALAGE D'AXES (Ajustement selon la norme Siril/FITS)
+        # On permute les deux derniers axes spatiaux (les dimensions 2 et 3) 
+        # pour corriger l'inversion Hauteur/Largeur (Transpose)
+        observed_exposures = observed_exposures.transpose(-2, -1)
+        
+        # On effectue un retournement vertical (Fliph) pour synchroniser 
+        # l'origine (0,0) du bas vers le haut du capteur
+        observed_exposures = torch.flip(observed_exposures, dims=[-2])
+
+    # 2. Extraction finale et contrôle de la géométrie corrigée
+    N, C, H_lr, W_lr = observed_exposures.shape
+    print("="*60)
+    print(f"📐 GÉOMÉTRIE CORRIGÉE -> Nombre de fichiers (Expositions) : {N}")
+    print(f"                       -> Canal astronomique monochrome : {C}")
+    print(f"                       -> Résolution spatiale réelle : {H_lr}x{W_lr} px")
+    print("="*60)
+    
+    # Initialisation des modèles avec la bonne dimension temporelle (N=5 fichiers réels)
+    psf_interpolator = SpatialMoffatInterpolator(num_frames=N, image_shape=(H_lr, W_lr))
+    star_finder = AstroStarFinder()
+
     scale_factor = 2
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     global_sky_hr = torch.zeros((1, 1, H_hr, W_hr))
@@ -659,17 +725,40 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             x_start = min(x, W_lr - tile_size)
             x_end = x_start + tile_size
             
-            # Extraction de la tuile active
+            # 1. Extraction et normalisation de la tuile active
             tile_lr = observed_exposures[..., y_start:y_end, x_start:x_end]
-            
-            # CORRECTION CRITIQUE : On normalise la dynamique entre 0.0 et 1.0 D'ABORD
             valeur_max_tile = torch.max(tile_lr)
             if valeur_max_tile > 1.0:
                 tile_lr = tile_lr / valeur_max_tile
                 
-            # Maintenant que la tuile est propre et normalisée, on lance le Star Finder
+            # 2. Analyse par le Star Finder
             density, has_stars, tile_mask = star_finder(tile_lr)
             
+            # --- APPLIQUER LE FILTRE FAST-PASS DE PRODUCTION ---
+            # Si le Star Finder détecte que la tuile est vide, on court-circuite le GPU
+            if not has_stars:
+                print(f"⏩ [FAST-PASS] Tuile Y[{y_start}:{y_end}], X[{x_start}:{x_end}] vide. Passage immédiat à la tuile suivante (Gain de temps : ~15 min).")
+                
+                # On remplit directement la zone finale avec la moyenne brute (pas de calcul DIP requis)
+                mean_tile_lr = torch.mean(tile_lr.view(-1, tile_size, tile_size), dim=0)
+                # On l'upsample par 2 pour correspondre à la grille HR de sortie
+                tile_sky_hr = F.interpolate(mean_tile_lr.unsqueeze(0).unsqueeze(0), scale_factor=2, mode='bilinear')
+                tile_bg_hr = torch.zeros_like(tile_sky_hr)
+                
+                # On injecte directement dans les accumulateurs globaux
+                y_start_hr, y_end_hr = y_start * scale_factor, y_end * scale_factor
+                x_start_hr, x_end_hr = x_start * scale_factor, x_end * scale_factor
+                global_sky_hr[:, :, y_start_hr:y_end_hr, x_start_hr:x_end_hr] += tile_sky_hr.cpu() * w_tile_hr
+                global_bg_hr[:, :, y_start_hr:y_end_hr, x_start_hr:x_end_hr] += tile_bg_hr.cpu() * w_tile_hr
+                weight_accumulator_hr[:, :, y_start_hr:y_end_hr, x_start_hr:x_end_hr] += w_tile_hr
+                
+                # On met à jour la barre de progression globale et on passe à la tuile suivante via 'continue'
+                global_progress.update(1)
+                continue
+                
+            # 3. Si la tuile est RICHE, on exécute l'optimisation lourde normalement
+            print(f"🟩 [DIP OPTIMIZATION] Traitement de la tuile stellaire en cours...")
+
             # Enregistrement du masque binaire global
             global_mask_lr[y_start:y_end, x_start:x_end] = torch.max(
                 global_mask_lr[y_start:y_end, x_start:x_end], tile_mask.squeeze()
