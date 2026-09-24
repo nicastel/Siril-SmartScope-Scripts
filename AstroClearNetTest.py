@@ -140,33 +140,45 @@ class AstroFWHMEstimator(nn.Module):
         star_mask_hr = F.interpolate(star_mask_lr, scale_factor=scale_factor, mode='nearest')
         stars_only = latent_z_hr * star_mask_hr
         
-        # 2. Sécurité : si la tuile est trop sombre ou le masque vide, on évite la division par zéro
-        if torch.sum(star_mask_hr) < 10 or torch.max(stars_only) < 1e-4:
-            return 8.0 # On renvoie une FWHM d'initialisation standard par défaut
-            
-        # 3. Méthode robuste par Moments Centrés (Variance spatiale du flux)
-        # On extrait les coordonnées des pixels actifs pour mesurer l'étalement réel de la lumière
-        indices = torch.nonzero(star_mask_hr.squeeze() > 0, as_tuple=True)
-        y_coords, x_coords = indices[0].float(), indices[1].float()
-        weights = stars_only.squeeze()[indices] + 1e-8
+        # CORRECTION INFALLIBLE : On force l'extraction en 2D en prenant la moyenne 
+        # sur toutes les dimensions en amont des deux axes de fin [Height, Width]
+        # Cela réduit instantanément la taille de 786432 à 262144 (soit 512x512)
+        height_hr, width_hr = stars_only.shape[-2], stars_only.shape[-1]
+        stars_2d = torch.mean(stars_only.view(-1, height_hr, width_hr), dim=0)
+        mask_2d = torch.mean(star_mask_hr.view(-1, height_hr, width_hr), dim=0)
         
-        # Calcul du centre de gravité (barycentre) de l'étoile
+        # 2. Sécurité : si la tuile est trop sombre ou le masque vide, on évite le calcul
+        if torch.sum(mask_2d) < 10 or torch.max(stars_2d) < 1e-4:
+            return 8.0 # Valeur d'initialisation standard par défaut
+            
+        # 3. Méthode des Moments Centrés (Variance spatiale du flux)
+        indices = torch.nonzero(mask_2d > 0, as_tuple=True)
+        
+        # CORRECTION : indices est un tuple (y_tensor, x_tensor)
+        # On extrait et convertit en float chaque composante séparément
+        y_coords = indices[0].float()
+        x_coords = indices[1].float()
+        
+        # L'indexation globale [indices] reste valide sur la matrice 2D stars_2d
+        weights = stars_2d[indices] + 1e-8
+        
+        # Calcul du centre de gravité (barycentre)
         centroid_y = torch.sum(y_coords * weights) / torch.sum(weights)
         centroid_x = torch.sum(x_coords * weights) / torch.sum(weights)
         
-        # Calcul de la variance (l'étalement quadratique moyen autour du centre)
+        # Calcul de la variance spatiale
         variance_y = torch.sum(((y_coords - centroid_y) ** 2) * weights) / torch.sum(weights)
         variance_x = torch.sum(((x_coords - centroid_x) ** 2) * weights) / torch.sum(weights)
         
-        # Formule de conversion : FWHM = 2 * sqrt(2 * ln(2)) * sigma ≈ 2.355 * sigma
+        # Conversion Variance -> FWHM (FWHM ≈ 2.355 * sigma)
         sigma = torch.sqrt((variance_y + variance_x) / 2.0)
         fwhm_estimate = 2.355 * sigma.item()
         
-        # Nouvelle sécurité pour éviter les valeurs aberrantes induites par le bruit de fond
         if fwhm_estimate < 1.0 or fwhm_estimate > 30.0:
             return 6.0
             
         return fwhm_estimate
+
 
 class AstroMixedNoiseLoss(nn.Module):
     def __init__(self, gain=1.0, read_noise=0.0):
@@ -379,6 +391,27 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     # Récupération du masque d'étoiles calculé en amont pour cette tuile (passé via kwargs)
     star_mask_lr = kwargs.get('tile_mask', torch.ones((1, 1, H_lr, W_lr)))
 
+    fwhm_estimator = AstroFWHMEstimator()
+    
+    # --- CALCUL DE LA FWHM INITIALE DE RÉFÉRENCE ---
+    # On mesure la FWHM sur la moyenne des images brutes observées (LR)
+    mean_obs_lr = torch.mean(observed_exposures_lr, dim=0, keepdim=True)
+    # On l'estime à l'échelle LR
+    fwhm_initiale_lr = fwhm_estimator(mean_obs_lr, star_mask_lr, scale_factor=1)
+    
+    # Comme le réseau z travaille à l'échelle HR (x2), la FWHM cible équivalente 
+    # sur l'image brute extrapolée serait :
+    fwhm_reference_hr = fwhm_initiale_lr * scale_factor
+    
+    print(f"   ↳ 🔍 FWHM brute initiale (échelle LR) : {fwhm_initiale_lr:.2f}px")
+    print(f"   ↳ 🎯 FWHM cible maximale (échelle HR) : {fwhm_reference_hr:.2f}px (Le traitement doit descendre sous ce seuil)")
+
+    # Paramètres de Early Stopping
+    meilleure_fwhm = float('inf')
+    patience = 50
+    declenchements_sans_amelioration = 0
+    iteration_arret = iterations
+
     for step in progress_bar:
         optimizer.zero_grad()
         
@@ -422,24 +455,32 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
             forward_model.shifts.data[0, :] = 0.0
             
         # --- CALCUL ET LOGIQUE DU EARLY STOPPING ---
-        if step >= 150 and step % 5 == 0 and kwargs.get('has_stars', True):
+        # --- CALCUL ET LOGIQUE DU EARLY STOPPING ---
+        if step >= 150:
             fwhm_actuelle = fwhm_estimator(latent_z_hr, star_mask_lr.to(device), scale_factor)
             
-            # Si l'image devient plus piquée (FWHM diminue)
+            # On vérifie si l'image actuelle fait MIEUX que la meilleure itération
             if fwhm_actuelle < meilleure_fwhm:
                 meilleure_fwhm = fwhm_actuelle
                 declenchements_sans_amelioration = 0
             else:
-                declenchements_sans_amelioration += 5
+                declenchements_sans_amelioration += 1
                 
-            # Affichage du monitoring dans la barre de progression
+            # --- AJOUT DE LA VÉRIFICATION D'EFFET ---
+            # On calcule le gain de netteté en % par rapport aux images brutes
+            gain_nettete = ((fwhm_reference_hr - fwhm_actuelle) / fwhm_reference_hr) * 100.0
+            
+            # Forcer la mise à jour textuelle dans tqdm
             progress_bar.set_postfix({
                 "Loss": f"{total_loss.item():.4f}",
-                "FWHM_HR": f"{fwhm_actuelle:.2f}px"
+                "FWHM_HR": f"{fwhm_actuelle:.2f}px",
+                "Gain": f"{gain_nettete:.1f}%",
+                "Patience": f"{declenchements_sans_amelioration}/{patience}"
             })
             
-            # Condition de coupure prématurée
-            if declenchements_sans_amelioration >= patience:
+            # Sécurité d'arrêt : on ne coupe que si la FWHM stagne ET qu'on a bien
+            # obtenu une amélioration (Gain > 0) par rapport aux fichiers FITS bruts
+            if declenchements_sans_amelioration >= patience and gain_nettete > 0.0 and kwargs.get('has_stars', True):
                 iteration_arret = step
                 break
         elif step % 10 == 0:
