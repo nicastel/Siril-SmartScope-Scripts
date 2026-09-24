@@ -406,8 +406,8 @@ class SpatialMoffatInterpolator:
 def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_factor=2, 
                                 batch_size=16, iterations=800, **kwargs):
     """
-    Version de production optimisée par Paramètre Explicite Direct (Convex Deconvolution).
-    Préservation totale du fond de ciel continu rugueux par découplage du clamp de positivité.
+    Version de production purifiée (Anti-NaN) par Paramètre Explicite Direct.
+    Nettoyage des pixels corrompus à la volée et Descente de Gradient Manuelle stabilisée.
     """
     import os
     import math
@@ -415,6 +415,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     import torch.nn as nn
     import torch.nn.functional as F
     from astropy.io import fits
+    import numpy as np
     
     # 1. Sélection dynamique du processeur (Priorité absolue au GPU)
     if torch.cuda.is_available():
@@ -430,68 +431,64 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     if observed_exposures_lr.dim() == 3:
         observed_exposures_lr = observed_exposures_lr.unsqueeze(1)
         
-    num_total_frames = observed_exposures_lr.shape[0]
+    # CORRECTION CRITIQUE : Extraction de l'index 0 pour obtenir un entier simple
+    num_total_frames = int(observed_exposures_lr.shape[0])
+    
     H_lr = int(observed_exposures_lr.shape[-2])
     W_lr = int(observed_exposures_lr.shape[-1])
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     
     # 3. CONVERSION MONOCHROME / LUMINANCE SI IMAGE COULEUR (RGB) DE 3 CANAUX
-    if observed_exposures_lr.dim() == 4 and observed_exposures_lr.shape[1] == 3:
+    if observed_exposures_lr.dim() == 4 and observed_exposures_lr.shape == 3:
         r = observed_exposures_lr[:, 0:1, :, :]
         g = observed_exposures_lr[:, 1:2, :, :]
         b = observed_exposures_lr[:, 2:3, :, :]
         observed_exposures_lr = 0.299 * r + 0.587 * g + 0.114 * b
 
     # =========================================================================
-    # 4. INITIALISATION DIRECTE PAR INJECTION DE PIXELS (WARM-START PARFAIT)
+    # 4. INITIALISATION DIRECTE ET NETTOYAGE DES PIXELS CORROMPUS (ANTI-NAN)
     # =========================================================================
+    # SÉCURITÉ ABSOLUE : On remplace de force les NaN ou Inf des images brutes par 0.0
+    observed_exposures_lr = torch.nan_to_num(observed_exposures_lr, nan=0.0, posinf=1.0, neginf=0.0)
+
     mean_tile_lr_cpu = torch.mean(observed_exposures_lr, dim=0, keepdim=True).cpu().float()
     target_start_hr_cpu = F.interpolate(mean_tile_lr_cpu, size=(H_hr, W_hr), mode='bilinear', align_corners=False)
     
-    # Création du paramètre d'image libre directement initialisé au pixel près (0.0403 à 0.2237)
-    print("🧠 [EXPLICIT INITIALIZATION] Injection directe des pixels de l'image de base...")
-    latent_image_param = nn.Parameter(target_start_hr_cpu.clone())
-    
-    # --- PHASE DE DIAGNOSTIC DES TABLEAUX (STRICTEMENT IDENTIQUES) ---
-    test_net_out = latent_image_param.detach().squeeze().numpy()
+    # Deuxième sécurité après interpolation
+    target_start_hr_cpu = torch.nan_to_num(target_start_hr_cpu, nan=0.0, posinf=1.0, neginf=0.0)
+
+    # Diagnostic initial sur le CPU
     test_target_hr = target_start_hr_cpu.squeeze().numpy()
-        
-    print(f"🔬 [CHECK ARRAYS] Net Out Shape: {test_net_out.shape} | Min: {test_net_out.min():.4f} | Max: {test_net_out.max():.4f}")
     print(f"🔬 [CHECK ARRAYS] Target HR Shape: {test_target_hr.shape} | Min: {test_target_hr.min():.4f} | Max: {test_target_hr.max():.4f}")
-    
     fits.writeto("DEBUG_TARGET_PURE.fits", test_target_hr, overwrite=True)
-    fits.writeto("DEBUG_NET_OUT_PURE.fits", test_net_out, overwrite=True)
-    print("🟩 Image de base injectée avec succès ! Le mode explicite direct est actif.")
 
     # =========================================================================
     # TRANSFERT DU PARAMÈTRE ET DES DONNÉES SUR LE GPU
     # =========================================================================
-    latent_image_param = nn.Parameter(latent_image_param.to(device))
+    latent_image_gpu = target_start_hr_cpu.clone().to(device)
+    latent_image_param = nn.Parameter(latent_image_gpu)
     
-    # CORRECTION CRITIQUE : La fonction lambda est linéaire pure pour laisser le flux 
-    # fluctuer librement sous la PSF. Le fond de ciel n'est plus purgé à 0.
     net = lambda x: latent_image_param  
     shape_witness_hr = torch.zeros((1, 1, H_hr, W_hr), device=device)
-    
-    print(f"🚀 [GPU TRANSITION] Paramètres transférés sur le processeur : {device}")
+    print(f"🚀 [GPU TRANSITION] Paramètres correctement ancrés sur le processeur : {device}")
 
-    # 5. INITIALISATION DU MODÈLE PHYSIQUE ET DE L'OPTIMISEUR GLOBAL
+    # 5. INITIALISATION DU MODÈLE PHYSIQUE ET DE L'OPTIMISEUR DES SHIFTS
     forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, kwargs.get('bg_degree', 2)).to(device)
     
-    # Le lr du background est figé à 0.0 pour interdire l'absorption du fond continu
-    optimizer = torch.optim.Adam([
-        {'params': [latent_image_param], 'lr': 0.01},
-        {'params': forward_model.bg_model_hr.parameters(), 'lr': 0.0}, 
+    # On conserve l'optimiseur Adam UNIQUEMENT pour les shifts géométriques
+    optimizer_shifts = torch.optim.Adam([
         {'params': forward_model.shifts, 'lr': 0.005} 
     ])
     
+    # FIX ULTRA-STABLE : Pas d'apprentissage adapté à la dynamique linéaire float32
+    lr_pixels = 0.0005 
+    
     # 6. CONFIGURATION DES CRITÈRES DE PERTE NETTOYÉS
     dni_data_criterion = AstroDynamicInvalidationLoss(base_criterion=F.mse_loss, start_iter=300)
-    
-    tv_criterion = TotalVariationLoss(weight=1e-11) # Allégé à 1e-11 pour sauver le bruit de grain naturel
-    sparsity_criterion = AstroSparsityL1Loss(weight_pixel=0.0, weight_gradient=0.0) # Désactivé pour sauver le continu
+    tv_criterion = TotalVariationLoss(weight=1e-7) 
     photo_criterion = AstroPhotometryConservationLoss(weight=kwargs.get('photo_weight', 1e-3), patch_size=32 * scale_factor)
-    bg_l2_criterion = PolynomialL2Regularization(weight=100.0) # Verrouillage du fond
+    sparsity_criterion = AstroSparsityL1Loss(weight_pixel=0.0, weight_gradient=0.0)
+    bg_l2_criterion = PolynomialL2Regularization(weight=100.0) 
     
     # Initialisation de l'estimateur scientifique de FWHM
     fwhm_estimator = AstroFWHMEstimator()
@@ -511,12 +508,14 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     declenchements_sans_amelioration = 0
     iteration_arret = iterations
     
-    # 7. BOUCLE D'OPTIMISATION PRINCIPALE PAR BATCH VRAM
+    # 7. BOUCLE D'OPTIMISATION PRINCIPALE AVEC DESCENTE DE GRADIENT MANUELLE SÉCURISÉE
     from tqdm import tqdm
     progress_bar = tqdm(range(iterations), desc="   ↳ Itérations DIP (Batched)", leave=False)
     
     for step in progress_bar:
-        optimizer.zero_grad()
+        if latent_image_param.grad is not None:
+            latent_image_param.grad.zero_()
+        optimizer_shifts.zero_grad()
         
         if num_total_frames > batch_size:
             indices_batch = torch.randperm(num_total_frames)[:batch_size]
@@ -529,7 +528,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
             batch_obs_lr = batch_obs_lr.squeeze(1)
         batch_obs_lr = torch.mean(batch_obs_lr, dim=1, keepdim=True) 
         
-        latent_z_hr = net(shape_witness_hr)
+        latent_z_hr = latent_image_param
         
         backup_psfs = forward_model.psfs_hr
         backup_shifts = forward_model.shifts
@@ -550,6 +549,20 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         total_loss = loss_data + loss_tv + loss_photo + loss_l1 + loss_bg_l2 + loss_anchor
         total_loss.backward()
         
+        # --- VERROU ANTI-NAN : GRADIENT CLIPPING ET NETTOYAGE ---
+        if latent_image_param.grad is not None:
+            # On remplace les NaN éventuels dans les gradients par sécurité
+            latent_image_param.grad.data = torch.nan_to_num(latent_image_param.grad.data, nan=0.0)
+            # Écrêtage strict des gradients pour interdire les emballements
+            latent_image_param.grad.data.clamp_(min=-0.1, max=0.1)
+        
+        # --- DESCENTE DE GRADIENT MANUELLE SÉCURISÉE EN VRAM ---
+        with torch.no_grad():
+            if latent_image_param.grad is not None:
+                latent_image_param.data -= lr_pixels * latent_image_param.grad
+                # On force le maintien de la positivité stricte après modification
+                latent_image_param.data.clamp_(min=0.0)
+        
         with torch.no_grad():
             backup_shifts.grad = torch.zeros_like(backup_shifts)
             backup_shifts.grad[indices_batch] = forward_model.shifts.grad
@@ -558,7 +571,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         forward_model.shifts = backup_shifts
         forward_model.num_frames = num_total_frames
         
-        optimizer.step()
+        optimizer_shifts.step()
         
         with torch.no_grad():
             forward_model.shifts.data[0, :] = 0.0 
@@ -566,9 +579,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         # --- EXPORT DE L'IMAGE TEMP TOUTES LES 50 ITERATIONS ---
         if step % 50 == 0:
             with torch.no_grad():
-                # CORRECTION CRITIQUE : On applique le clamp STRICTEMENT au moment de l'écriture
-                # sur le disque pour que Siril affiche l'image correctement, sans détruire la dynamique GPU
-                preview_sky_hr = torch.clamp(net(shape_witness_hr), min=0.0)
+                preview_sky_hr = torch.clamp(latent_image_param, min=0.0)
                 preview_sky_hr = preview_sky_hr.detach().cpu().squeeze().numpy()
                 
                 hdu_preview = fits.PrimaryHDU(data=preview_sky_hr)
@@ -576,9 +587,12 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
 
         # --- LOGIQUE SCIENTIFIQUE DU EARLY STOPPING ---
         if step >= 300:
-            # On passe le tenseur clampé à l'estimateur pour la FWHM
             latent_z_hr_clamp = torch.clamp(latent_z_hr, min=0.0)
             fwhm_actuelle = fwhm_estimator(latent_z_hr_clamp, star_mask_lr.to(device), scale_factor)
+            
+            # Si le calcul de FWHM renvoie NaN à cause d'une zone vide, on le protège
+            if math.isnan(fwhm_actuelle):
+                fwhm_actuelle = 12.0
             
             if fwhm_actuelle < meilleure_fwhm:
                 meilleure_fwhm = fwhm_actuelle
@@ -598,6 +612,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
             if declenchements_sans_amelioration >= 100 and gain_nettete > 0.0 and kwargs.get('has_stars', True):
                 iteration_arret = step
                 break
+            
         else:
             if step % 20 == 0:
                 progress_bar.set_postfix({
@@ -608,7 +623,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     print(f"   ↳ 🏁 Fin de la tuile à l'itération {iteration_arret}/{iterations} | Meilleure FWHM : {meilleure_fwhm:.2f}px")
     
     with torch.no_grad():
-        final_sky_hr = net(shape_witness_hr)
+        final_sky_hr = torch.clamp(latent_image_param, min=0.0)
         _, final_bg_hr = forward_model(final_sky_hr)
         
     return final_sky_hr.detach().cpu(), final_bg_hr.detach().cpu()
