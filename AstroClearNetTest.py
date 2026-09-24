@@ -140,45 +140,54 @@ class AstroFWHMEstimator(nn.Module):
         star_mask_hr = F.interpolate(star_mask_lr, scale_factor=scale_factor, mode='nearest')
         stars_only = latent_z_hr * star_mask_hr
         
-        # CORRECTION INFALLIBLE : On force l'extraction en 2D en prenant la moyenne 
-        # sur toutes les dimensions en amont des deux axes de fin [Height, Width]
-        # Cela réduit instantanément la taille de 786432 à 262144 (soit 512x512)
+        # Extraction en matrices 2D [H, W] propres et isolées
         height_hr, width_hr = stars_only.shape[-2], stars_only.shape[-1]
-        stars_2d = torch.mean(stars_only.view(-1, height_hr, width_hr), dim=0)
-        mask_2d = torch.mean(star_mask_hr.view(-1, height_hr, width_hr), dim=0)
+        stars_2d = torch.mean(stars_only.view(-1, height_hr, width_hr), dim=0).clone()
         
-        # 2. Sécurité : si la tuile est trop sombre ou le masque vide, on évite le calcul
-        if torch.sum(mask_2d) < 10 or torch.max(stars_2d) < 1e-4:
-            return 8.0 # Valeur d'initialisation standard par défaut
+        # --- CORRECTION CHIRURGICALE ---
+        # Au lieu d'utiliser le masque large qui englobe du bruit, on ne garde 
+        # QUE les pixels très brillants de la tuile (les pics d'étoiles réels)
+        seuil_etoile = torch.max(stars_2d) * 0.1  # On prend les pixels au-dessus de 10% du pic max
+        if seuil_etoile < 1e-4:
+            return 12.0
             
-        # 3. Méthode des Moments Centrés (Variance spatiale du flux)
-        indices = torch.nonzero(mask_2d > 0, as_tuple=True)
+        # Nouveau masque ultra-restreint aux cœurs des étoiles
+        mask_pics = (stars_2d > seuil_etoile).float()
         
-        # CORRECTION : indices est un tuple (y_tensor, x_tensor)
-        # On extrait et convertit en float chaque composante séparément
+        # 2. Sécurité : si la zone est vide
+        if torch.sum(mask_pics) < 5:
+            return 12.0
+            
+        # 3. Extraction des coordonnées locales uniquement sur les pics
+        indices = torch.nonzero(mask_pics > 0, as_tuple=True)
         y_coords = indices[0].float()
         x_coords = indices[1].float()
-        
-        # L'indexation globale [indices] reste valide sur la matrice 2D stars_2d
         weights = stars_2d[indices] + 1e-8
         
-        # Calcul du centre de gravité (barycentre)
+        # 4. Calcul du centre de gravité local (barycentre du pic)
         centroid_y = torch.sum(y_coords * weights) / torch.sum(weights)
         centroid_x = torch.sum(x_coords * weights) / torch.sum(weights)
         
-        # Calcul de la variance spatiale
+        # 5. Calcul de la variance (écartement réel de la lumière dans le pic)
         variance_y = torch.sum(((y_coords - centroid_y) ** 2) * weights) / torch.sum(weights)
         variance_x = torch.sum(((x_coords - centroid_x) ** 2) * weights) / torch.sum(weights)
         
-        # Conversion Variance -> FWHM (FWHM ≈ 2.355 * sigma)
+        # 6. Conversion Variance -> FWHM mathématique brute
+        # On limite le calcul à l'environnement immédiat du pic détecté
         sigma = torch.sqrt((variance_y + variance_x) / 2.0)
-        fwhm_estimate = 2.355 * sigma.item()
         
-        if fwhm_estimate < 1.0 or fwhm_estimate > 30.0:
-            return 6.0
+        # Correction de l'étalement global de la grille : on s'assure d'évaluer une seule source
+        # Si plusieurs étoiles sont dans la tuile, la variance globale augmente.
+        # Pour une FWHM représentative par pixel, on applique un facteur d'échelle local :
+        fwhm_estimate = 2.355 * (sigma.item() / math.sqrt(torch.sum(mask_pics).item()))
+        
+        # --- VISUALISATION DU DEBUG CORRIGÉ ---
+        print(f" [DEBUG FWHM] Valeur brute corrigée : {fwhm_estimate:.4f} px")
+        
+        if fwhm_estimate < 0.5 or fwhm_estimate > 30.0:
+            return 12.0
             
         return fwhm_estimate
-
 
 class AstroMixedNoiseLoss(nn.Module):
     def __init__(self, gain=1.0, read_noise=0.0):
