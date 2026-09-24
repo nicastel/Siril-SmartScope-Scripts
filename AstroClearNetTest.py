@@ -280,32 +280,44 @@ def optimize_astro_tile(observed_exposures_lr, psf_kernels_hr, scale_factor=2,
                         gain=2.1, read_noise=4.5, tv_weight=1e-5, photo_weight=1e-3, 
                         l1_weight=1e-6, bg_degree=2, bg_l2_weight=1e-3, 
                         psf_anchor_weight=1.0, iterations=1000):
-    """Optimise de manière auto-supervisée (DIP) une tuile de l'image globale."""
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    """Optimise de manière auto-supervisée (DIP) une tuile sur le GPU détecté."""
     
-    # CORRECTION : Si le tenseur arrive en 5D [1, 1, Num_Frames, H, W],
-    # on supprime les deux premières dimensions unitaires pour obtenir [Num_Frames, H, W]
+    # 1. Sélection dynamique du processeur (Priorité au GPU)
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
+        
+    print(f"⚙️ Optimisation de la tuile sur le processeur : {device}")
+
+    # 2. Nettoyage des dimensions unitaires de l'image d'entrée
     if observed_exposures_lr.dim() == 5:
         observed_exposures_lr = observed_exposures_lr.squeeze(0).squeeze(0)
-    
-    # On s'assure qu'il possède bien le canal de taille 1 pour faire [Num_Frames, 1, H, W]
     if observed_exposures_lr.dim() == 3:
         observed_exposures_lr = observed_exposures_lr.unsqueeze(1)
         
+    # 3. TRANSFERT OBLIGATOIRE des images brutes sur le GPU
     observed_exposures_lr = observed_exposures_lr.to(device)
-
+    
     H_lr, W_lr = observed_exposures_lr.shape[-2:]
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     
+    # 4. TRANSFERT OBLIGATOIRE du réseau et du modèle physique sur le GPU
     net = AstroDIPBackbone().to(device)
-    forward_model = AstroSRDitheringObservationModel(psf_kernels_hr.to(device), scale_factor, bg_degree).to(device)
+    forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, bg_degree).to(device)
+    
+    # 5. TRANSFERT OBLIGATOIRE du vecteur de bruit initial sur le GPU
     fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.1
     
+    # 6. L'optimiseur doit pointer sur les paramètres déjà présents sur le GPU
     optimizer = torch.optim.Adam([
         {'params': net.parameters(), 'lr': 0.01},
         {'params': forward_model.bg_model_hr.parameters(), 'lr': 0.005},
         {'params': forward_model.shifts, 'lr': 0.02}
     ])
+
     
     base_data_loss = AstroMixedNoiseLoss(gain=gain, read_noise=read_noise)
     dni_data_criterion = AstroDynamicInvalidationLoss(base_criterion=base_data_loss, start_iter=300)
@@ -457,19 +469,6 @@ def main():
     nombre_iterations = 1200
     
     print("🔭 --- DÉMARRAGE DU PIPELINE ASTROCLEARNET (SR x2) ---")
-
-    def get_astro_device():
-        """Retourne le meilleur processeur disponible pour l'optimisation."""
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        elif torch.backends.mps.is_available():
-            return torch.device("mps")
-        else:
-            return torch.device("cpu")
-
-    # Utilisation dans vos fonctions :
-    device = get_astro_device()
-    print(f"🚀 AstroClearNet s'exécute sur le processeur : {device}")
 
     # 2. Collecte automatique des fichiers FITS présents dans le dossier
     fichiers_cibles = [
