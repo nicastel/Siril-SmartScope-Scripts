@@ -17,7 +17,7 @@ from tqdm import tqdm
 # 1. COMPOSANTS DE L'ARCHITECTURE (BACKBONE & MODELES PHYSIQUES)
 # =====================================================================
 class AstroDIPBackbone(nn.Module):
-    """Moteur multi-échelle U-Net adapté aux nébulosités et aux étoiles (Softplus linéaire)."""
+    """Moteur multi-échelle U-Net standardisé pour entrée bruit blanc (1 canal)."""
     def __init__(self, in_channels=1, out_channels=1, base_filters=64):
         super(AstroDIPBackbone, self).__init__()
         
@@ -40,16 +40,19 @@ class AstroDIPBackbone(nn.Module):
         self.dec1 = nn.Sequential(
             nn.Conv2d(base_filters + base_filters, out_channels, kernel_size=3, padding=1)
         )
-        # Activation Softplus pour garantir la positivité tout en conservant les gradients des nébuleuses
-        self.softplus = nn.Softplus(beta=20.0)
 
     def forward(self, x):
+        """Reçoit directement le bruit blanc [1, 1, H, W] sans grille géométrique."""
         s1 = self.enc1(x)
         s2 = self.enc2(s1)
         b  = self.bottleneck(s2)
         d2 = self.dec2(b)
+        
+        # Concaténation et sortie [1, 1, H, W]
         out = self.dec1(torch.cat([d2, s1], dim=1))
-        return self.softplus(out)
+        
+        # Leaky ReLU fluide finale pour conserver les nuances subtiles des nébuleuses
+        return F.leaky_relu(out, negative_slope=0.05)
 
 class GlobalBackgroundGradientModel(nn.Module):
     """Modélise un gradient de fond de ciel global basse fréquence via un polynôme 2D."""
@@ -390,8 +393,8 @@ class SpatialMoffatInterpolator:
 def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_factor=2, 
                                 batch_size=16, iterations=800, **kwargs):
     """
-    Version de production unifiée et stabilisée d'AstroClearNet.
-    Préservation absolue des nébulosités et du fond continu par exclusion du fond polynomial.
+    Version de production épurée d'AstroClearNet.
+    Suppression des critères de perte photométriques parasites pour éliminer les formes géométriques.
     """
     import os
     import math
@@ -401,6 +404,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     from astropy.io import fits
     import numpy as np
     
+    # 1. Sélection du processeur GPU/CPU
     if torch.cuda.is_available():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
@@ -408,6 +412,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     else:
         device = torch.device("cpu")
         
+    # 2. Nettoyage des dimensions géométriques (Forçage entiers standards)
     if observed_exposures_lr.dim() == 5:
         observed_exposures_lr = observed_exposures_lr.squeeze(0).squeeze(0)
     if observed_exposures_lr.dim() == 3:
@@ -418,6 +423,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     W_lr = int(observed_exposures_lr.shape[-1])
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     
+    # 3. Conversion monochrome si données RGB
     if observed_exposures_lr.dim() == 4 and observed_exposures_lr.shape[1] == 3:
         r = observed_exposures_lr[:, 0:1, :, :]
         g = observed_exposures_lr[:, 1:2, :, :]
@@ -427,43 +433,46 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     observed_exposures_lr = torch.nan_to_num(observed_exposures_lr, nan=0.0, posinf=1.0, neginf=0.0)
 
     # =========================================================================
-    # 4. INITIALISATION DU MOTEUR DIP (RÉSEAU + BRUIT BLANC STANDARD)
+    # 4. INITIALISATION DU MOTEUR DIP (RETOUR AUX STANDARDS ROBUSTES)
     # =========================================================================
-    fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.05
+    # On utilise un bruit d'entrée 2D standard au lieu de la grille Meshgrid 
+    # pour casser définitivement la génération de motifs géométriques répétitifs.
+    fixed_noise_input_hr = torch.randn(1, 1, H_hr, W_hr, device=device) * 0.1
+    
+    # Réseau ré-initialisé sur 1 canal d'entrée de bruit blanc
     net = AstroDIPBackbone(in_channels=1, out_channels=1).to(device)
     
     mean_tile_lr_cpu = torch.mean(observed_exposures_lr, dim=0, keepdim=True).cpu().float()
     
-    # Configuration du biais de sortie sur la moyenne pour allumer le fond de ciel
+    # Initialisation douce du biais de sortie sur la moyenne brute
     with torch.no_grad():
         net.dec1[0].bias.data.fill_(float(mean_tile_lr_cpu.mean()))
         
-    print("🟩 Moteur U-Net initialisé pour la déconvolution des nébulosités.")
+    print("🟩 Moteur U-Net standard réactivé. Nettoyage des critères parasites.")
 
-    # 5. INITIALISATION DU MODÈLE PHYSIQUE ET DE L'OPTIMISEUR SÉCURISÉ
+    # 5. INITIALISATION DU MODÈLE PHYSIQUE ET DE L'OPTIMISEUR
     forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, bg_degree=0).to(device)
     
-    # FIX ULTRA-STABLE : On adoucit le LR à 0.0005 pour empêcher les chutes brutales au noir
+    # Optimisation exclusive des paramètres du réseau de neurones avec un LR standard stable
     optimizer = torch.optim.Adam([
-        {'params': net.parameters(), 'lr': 0.0005}, 
+        {'params': net.parameters(), 'lr': 0.001}, 
         {'params': forward_model.shifts, 'lr': 0.001} 
     ])
     
-    # 6. CONFIGURATION DES CRITÈRES DE PERTE HARMONISÉS
+    # 6. CONFIGURATION DES CRITÈRES DE PERTE ÉPURÉS (MSE PURE + TV PROTECTION)
     dni_data_criterion = AstroDynamicInvalidationLoss(base_criterion=F.mse_loss, start_iter=300)
     
-    # Huber TV doux : préserve les extensions gazeuses continues des nébuleuses
-    tv_criterion = TotalVariationLoss(weight=1e-8) 
-    sparsity_criterion = AstroSparsityL1Loss(weight_pixel=0.0, weight_gradient=0.0)
+    # TV Huber douce pour préserver le grain continu de vos nébuleuses sans bruits de blocs
+    tv_criterion = TotalVariationLoss(weight=1e-7) 
     
-    # Pénalité de flux photométrique stricte
-    photo_criterion = AstroPhotometryConservationLoss(weight=10.0, patch_size=32 * scale_factor)
+    # --- LES PERTES PHOTOMÉTRIQUES ET DE SPARSITÉ PARASITES ONT ÉTÉ SUPPRIMÉES ---
     
     fwhm_estimator = AstroFWHMEstimator()
     star_mask_lr = kwargs.get('tile_mask', torch.ones((1, 1, H_lr, W_lr)))
     
     with torch.no_grad():
-        fwhm_initiale_lr = fwhm_estimator(mean_tile_lr_cpu.to(device), star_mask_lr.to(device), scale_factor=1)
+        mean_tile_lr_device = mean_tile_lr_cpu.to(device)
+        fwhm_initiale_lr = fwhm_estimator(mean_tile_lr_device, star_mask_lr.to(device), scale_factor=1)
         fwhm_reference_hr = fwhm_initiale_lr * scale_factor
 
     meilleure_fwhm = float('inf')
@@ -471,7 +480,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     declenchements_sans_amelioration = 0
     iteration_arret = iterations
     
-    # 7. BOUCLE NEURONALE DE PRODUCTION
+    # 7. BOUCLE NEURONALE STANDARDISÉE
     from tqdm import tqdm
     progress_bar = tqdm(range(iterations), desc="   ↳ Itérations DIP (Batched)", leave=False)
     
@@ -488,6 +497,12 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
             batch_obs_lr = batch_obs_lr.squeeze(1)
         batch_obs_lr = torch.mean(batch_obs_lr, dim=1, keepdim=True) 
         
+        # --- VERROU DE DITHERING TEMPORAIRE ---
+        if step < 200:
+            with torch.no_grad():
+                forward_model.shifts.data.zero_()
+        
+        # Le réseau reconstruit l'image à partir du bruit blanc standardisé
         latent_z_hr = net(fixed_noise_input_hr)
         
         backup_psfs = forward_model.psfs_hr
@@ -496,18 +511,15 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         forward_model.shifts = nn.Parameter(forward_model.shifts[indices_batch])
         forward_model.num_frames = len(indices_batch)
         
-        # Le modèle avant calcule la projection pure
         predicted_lr, _ = forward_model(latent_z_hr)
         
-        # Somme des pertes nettoyées
         loss_data = dni_data_criterion(predicted_lr, batch_obs_lr, step)
         loss_tv = tv_criterion(latent_z_hr)
-        loss_photo = photo_criterion(latent_z_hr, batch_obs_lr)
         
-        total_loss = loss_data + loss_tv + loss_photo
+        # Somme épurée
+        total_loss = loss_data + loss_tv
         total_loss.backward()
         
-        # Gradient clipping préventif pour bloquer la dérive vers le noir
         nn.utils.clip_grad_norm_(net.parameters(), max_norm=1.0)
         
         forward_model.psfs_hr = backup_psfs
@@ -515,6 +527,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         forward_model.num_frames = num_total_frames
         
         optimizer.step()
+        
         with torch.no_grad():
             forward_model.shifts.data[0, :] = 0.0 
             
@@ -542,7 +555,7 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
             gain_nettete = ((fwhm_reference_hr - fwhm_actuelle) / fwhm_reference_hr) * 100.0
             
             progress_bar.set_postfix({
-                "Loss": f"{total_loss.item():.4f}",
+                "Loss": f"{total_loss.item():.6f}",
                 "FWHM_HR": f"{fwhm_actuelle:.2f}px",
                 "Gain": f"{gain_nettete:.1f}%",
                 "Patience": f"{declenchements_sans_amelioration}/100"
@@ -554,8 +567,8 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         else:
             if step % 20 == 0:
                 progress_bar.set_postfix({
-                    "Loss": f"{total_loss.item():.4f}", 
-                    "FWHM_HR": "Attendre Conv 300"
+                    "Loss": f"{total_loss.item():.6f}", 
+                    "FWHM_HR": "Convergence..."
                 })
                 
     print(f"   ↳ 🏁 Fin de la tuile à l'itération {iteration_arret}/{iterations} | Meilleure FWHM : {meilleure_fwhm:.2f}px")
