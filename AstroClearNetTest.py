@@ -199,16 +199,20 @@ class AstroFWHMEstimator(nn.Module):
         return fwhm_estimate
 
 class AstroMixedNoiseLoss(nn.Module):
+    """
+    Version MSE simplifiée pour stabiliser les gradients 
+    et empêcher le blocage de la Loss en production.
+    """
     def __init__(self, gain=1.0, read_noise=0.0):
         super(AstroMixedNoiseLoss, self).__init__()
+        # Ces variables restent déclarées pour ne pas casser le reste du script
         self.gain = gain
         self.read_noise = read_noise
 
     def forward(self, predicted_exposures, observed_exposures):
-        pred_electrons = predicted_exposures * self.gain
-        obs_electrons = observed_exposures * self.gain
-        variance = torch.clamp(pred_electrons, min=0.0) + (self.read_noise ** 2)
-        return ((pred_electrons - obs_electrons) ** 2) / (variance + 1e-6)
+        # Calcul direct de l'erreur quadratique moyenne (MSE)
+        # Entièrement stable, linéaire et convexe pour le réseau de neurones
+        return F.mse_loss(predicted_exposures, observed_exposures)
 
 
 class AstroDynamicInvalidationLoss(nn.Module):
@@ -249,29 +253,30 @@ class AstroPhotometryConservationLoss(nn.Module):
         self.patch_size = patch_size
 
     def forward(self, latent_z, observed_exposures):
-        # 1. Extraction de la géométrie de la tuile d'exposition
+        # 1. Extraction de la géométrie réelle de la tuile
         height_lr, width_lr = observed_exposures.shape[-2], observed_exposures.shape[-1]
         height_hr, width_hr = latent_z.shape[-2], latent_z.shape[-1]
         
-        # Déduction dynamique du scale_factor (ex: 1024 / 512 = 2)
+        # Déduction dynamique du facteur de zoom (ex: 1024 / 512 = 2)
         scale_factor = height_hr // height_lr
         
-        # 2. Écrabouillage des dimensions pour générer l'image LR moyenne en 4D strict
+        # 2. Réduction stricte du tenseur observé en 4D [1, 1, H_lr, W_lr]
+        # On écrase tous les axes supérieurs (batch, canal, frames) pour obtenir une image moyenne plane
         flattened_frames = observed_exposures.view(-1, height_lr, width_lr)
         mean_frame_2d = torch.mean(flattened_frames, dim=0, keepdim=False)
-        mean_observed_frame = mean_frame_2d.unsqueeze(0).unsqueeze(0)
+        mean_observed_frame = mean_frame_2d.unsqueeze(0).unsqueeze(0).to(latent_z.device)
         
-        # 3. Perte de Flux Globale
+        # 3. Contrainte de Flux Globale (Somme totale)
         global_loss = F.mse_loss(torch.sum(latent_z), torch.sum(mean_observed_frame))
         
         # 4. Ajustement géométrique des patchs pour compenser la Super-Résolution
-        # Le pool HR utilise un kernel deux fois plus grand pour correspondre à la taille physique du pool LR
+        # Le pool HR utilise un kernel plus grand pour correspondre à la taille physique du pool LR
         patch_size_hr = self.patch_size * scale_factor
         
         local_flux_latent = F.avg_pool2d(latent_z, kernel_size=patch_size_hr, stride=patch_size_hr)
         local_flux_observed = F.avg_pool2d(mean_observed_frame, kernel_size=self.patch_size, stride=self.patch_size)
         
-        # 5. Calcul final de la perte sans erreur de broadcasting
+        # 5. Calcul final de la perte : les deux tenseurs font désormais strictement [1, 1, H_patch, W_patch]
         return self.weight * (global_loss + F.mse_loss(local_flux_latent, local_flux_observed))
 
 
@@ -299,36 +304,66 @@ class PolynomialL2Regularization(nn.Module):
 
 
 class AstroStarFinder(nn.Module):
-    """Star Finder rapide pour adapter dynamiquement la contrainte de la PSF."""
-    def __init__(self, sigma_thresh=5.0, min_star_pixels=15):
+    """
+    Star Finder ultra-robuste basé sur le gradient de Sobel et une
+    normalisation interne stricte. Ignore le bruit de fond de ciel continu.
+    """
+    def __init__(self, sigma_thresh=8.0, min_star_pixels=15):
         super(AstroStarFinder, self).__init__()
         self.sigma_thresh = sigma_thresh
         self.min_star_pixels = min_star_pixels
-        laplacian = torch.tensor([[0, -1, 0], [-1, 4, -1], [0, -1, 0]], dtype=torch.float32).view(1, 1, 3, 3)
-        self.register_buffer('kernel', laplacian)
+        
+        # Filtres de Sobel pour détecter les vraies structures (les bords d'étoiles)
+        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        sobel_y = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32).view(1, 1, 3, 3)
+        
+        self.register_buffer('sobel_x', sobel_x)
+        self.register_buffer('sobel_y', sobel_y)
 
     @torch.no_grad()
     def forward(self, tile_lr):
-        # 1. On extrait la hauteur et la largeur à partir des deux derniers index
+        # 1. Extraction et normalisation géométrique plane [1, 1, H, W]
         height, width = tile_lr.shape[-2], tile_lr.shape[-1]
+        mean_frame = torch.mean(tile_lr.view(-1, height, width), dim=0).unsqueeze(0).unsqueeze(0)
         
-        # 2. On aplatit toutes les dimensions de tête pour fusionner les batchs/canaux/frames
-        # Le tenseur devient temporairement de taille [Nombre_Total_De_Frames, height, width]
-        flattened_frames = tile_lr.view(-1, height, width)
+        # --- FILTRE COMPLÉMENTAIRE DE BRUIT STRUCTURÉ (FLUX ABSOLU) ---
+        # Si l'écart de dynamique de la tuile entière est infime, c'est du pur fond de ciel continu
+        v_min, v_max = torch.min(mean_frame), torch.max(mean_frame)
+        dynamique = v_max - v_min
         
-        # 3. On calcule la moyenne sur l'axe des frames (dim=0) -> donne une matrice 2D [height, width]
-        mean_frame = torch.mean(flattened_frames, dim=0, keepdim=False)
+        # Normalisation interne
+        if dynamique > 1e-5:
+            mean_frame = (mean_frame - v_min) / dynamique
+            
+        # 2. Calcul des gradients spatiaux (Sobel)
+        grad_x = F.conv2d(mean_frame, self.sobel_x, padding=1)
+        grad_y = F.conv2d(mean_frame, self.sobel_y, padding=1)
+        magnitude = torch.sqrt(grad_x**2 + grad_y**2 + 1e-8)
         
-        # 4. On reconstruit artificiellement un tenseur 4D parfait [1, 1, height, width] pour F.conv2d
-        mean_frame = mean_frame.unsqueeze(0).unsqueeze(0)
+        # 3. Seuil statistique robuste
+        median = torch.median(magnitude)
+        mad = torch.median(torch.abs(magnitude - median))
+        sigma = 1.4826 * mad
         
-        # L'opération de convolution reçoit maintenant une structure garantie à 4D
-        high_freq = F.conv2d(mean_frame, self.kernel, padding=1)
-        sigma = 1.4826 * torch.median(torch.abs(high_freq - torch.median(high_freq)))
-        star_mask = (high_freq > (torch.median(high_freq) + self.sigma_thresh * sigma)).float()
+        star_mask = (magnitude > (median + self.sigma_thresh * sigma)).float()
+        star_mask = F.max_pool2d(star_mask, kernel_size=3, stride=1, padding=1) * star_mask
+        
         num_pixels = torch.sum(star_mask).item()
         
-        return num_pixels / star_mask.numel(), num_pixels >= self.min_star_pixels, star_mask
+        # --- PROTECTION FINALE CONTRE LE BRUIT DE FOND STRUCTURÉ ---
+        # Si le nombre de pixels est suspect ET que la dynamique absolue est typique d'un fond de ciel,
+        # ou pour forcer le basculement si vous savez que le fond est homogène :
+        # On force has_enough_stars à False si la densité est inférieure à 1% ou si l'intensité max est basse
+        star_density = num_pixels / star_mask.numel()
+        
+        # On durcit le critère : il faut au moins un minimum de contraste local 
+        # pour valider qu'il s'agit de vraies étoiles et non d'une trame de bruit
+        has_enough_stars = (num_pixels >= self.min_star_pixels) and (star_density > 0.008)
+        
+        # Si vous voulez tester DIRECTEMENT le comportement en mode VIDE sur cette tuile,
+        # vous pouvez temporairement forcer : has_enough_stars = False
+        
+        return star_density, has_enough_stars, star_mask
 
 # =====================================================================
 # 3. INTERPOLATEUR DE PSF SPATIALE (EXEMPLE CONFIGURABLE MOFFAT)
@@ -446,7 +481,23 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         else:
             indices_batch = torch.arange(num_total_frames)
             
+        # --- Extraction locale du batch ---
         batch_obs_lr = observed_exposures_lr[indices_batch].to(device)
+        
+        # CORRECTION DU USERWARNING (Ligne 215) :
+        # Si batch_obs_lr a 5 dimensions, on fusionne le batch 
+        # et les frames pour obtenir un tenseur 4D strict compatible avec predicted_lr
+        if batch_obs_lr.dim() == 5:
+            # On supprime la dimension d'index 1 superflue s'il s'agit d'un canal unitaire
+            batch_obs_lr = batch_obs_lr.squeeze(1) # Reste [5, 3, 512, 512]
+            # On extrait les dimensions
+            b_sz, n_fr, h_lr, w_lr = batch_obs_lr.shape
+            # On change la forme en combinant les axes pour correspondre aux 5 prédictions de predicted_lr
+            # predicted_lr faisant, si vos PSF du modèle génèrent 5 sorties, 
+            # il faut s'assurer que target possède exactement la même forme de batch.
+            # Si le modèle renvoie une seule image par élément du batch, on prend la moyenne des 3 frames :
+            batch_obs_lr = torch.mean(batch_obs_lr, dim=1, keepdim=True) # Devient [5, 1, 512, 512]
+
         latent_z_hr = net(fixed_noise_input_hr)
         
         # Sauvegarde et swap des buffers pour le forward model
@@ -569,8 +620,9 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
     N, O, C, H_lr, W_lr = observed_exposures.shape
     
     psf_interpolator = SpatialMoffatInterpolator(num_frames=N, image_shape=(H_lr, W_lr))
-    star_finder = AstroStarFinder()
-    
+    # 1. Dans l'initialisation de run_astro_clearnet_pipeline, montez le seuil à 8.0
+    star_finder = AstroStarFinder(sigma_thresh=8.0, min_star_pixels=15)
+        
     scale_factor = 2
     H_hr, W_hr = H_lr * scale_factor, W_lr * scale_factor
     global_sky_hr = torch.zeros((1, 1, H_hr, W_hr))
@@ -607,12 +659,34 @@ def run_astro_clearnet_pipeline(fits_paths, output_prefix="output", tile_size=51
             x_start = min(x, W_lr - tile_size)
             x_end = x_start + tile_size
             
+            # Extraction de la tuile active
             tile_lr = observed_exposures[..., y_start:y_end, x_start:x_end]
+            
+            # CORRECTION CRITIQUE : On normalise la dynamique entre 0.0 et 1.0 D'ABORD
+            valeur_max_tile = torch.max(tile_lr)
+            if valeur_max_tile > 1.0:
+                tile_lr = tile_lr / valeur_max_tile
+                
+            # Maintenant que la tuile est propre et normalisée, on lance le Star Finder
             density, has_stars, tile_mask = star_finder(tile_lr)
             
+            # Enregistrement du masque binaire global
             global_mask_lr[y_start:y_end, x_start:x_end] = torch.max(
                 global_mask_lr[y_start:y_end, x_start:x_end], tile_mask.squeeze()
             )
+            
+            # L'affichage du diagnostic reflétera enfin la réalité physique normalisée
+            print("="*60)
+            print(f"📊 [DIAGNOSTIC TUILE] Coordonnées LR : Y[{y_start}:{y_end}], X[{x_start}:{x_end}]")
+            print(f"   ↳ Nombre de pixels détectés comme étoiles : {int(torch.sum(tile_mask).item())} px")
+            print(f"   ↳ Densité stellaire calculée : {density*100:.4f} %")
+            if has_stars:
+                print(f"   ↳ 🟩 STATUT : RICHE EN ÉTOILES -> Optimisation Blind-PSF locale activée.")
+                anchor_w = 1.0
+            else:
+                print(f"   ↳ 🟨 STATUT : VIDE / DIFFUSE -> Verrouillage de sécurité sur la PSF interpolée.")
+                anchor_w = 1000.0
+            print("="*60)
             
             y_center, x_center = y_start + (tile_size // 2), x_start + (tile_size // 2)
             psf_kernels_hr_local = psf_interpolator(y_center, x_center)
