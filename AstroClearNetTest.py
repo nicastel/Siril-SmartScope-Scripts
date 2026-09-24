@@ -454,10 +454,12 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
     forward_model = AstroSRDitheringObservationModel(psf_kernels_hr, scale_factor, bg_degree=0).to(device)
     
     # Optimisation exclusive des paramètres du réseau de neurones avec un LR standard stable
+    # --- À MODIFIER DANS LA SECTION 5 ---
     optimizer = torch.optim.Adam([
-        {'params': net.parameters(), 'lr': 0.001}, 
+        {'params': net.parameters(), 'lr': 0.005}, # Augmenté à 0.005
         {'params': forward_model.shifts, 'lr': 0.001} 
     ])
+
     
     # 6. CONFIGURATION DES CRITÈRES DE PERTE ÉPURÉS (MSE PURE + TV PROTECTION)
     dni_data_criterion = AstroDynamicInvalidationLoss(base_criterion=F.mse_loss, start_iter=300)
@@ -492,7 +494,9 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         else:
             indices_batch = torch.arange(num_total_frames)
             
-        batch_obs_lr = observed_exposures_lr[indices_batch].to(device)
+        # --- À MODIFIER DANS LA BOUCLE PRINCIPALE ---
+        # On extrait le batch et on force le float32 strict sur le GPU actif
+        batch_obs_lr = observed_exposures_lr[indices_batch].to(device=device, dtype=torch.float32)
         if batch_obs_lr.dim() == 5:
             batch_obs_lr = batch_obs_lr.squeeze(1)
         batch_obs_lr = torch.mean(batch_obs_lr, dim=1, keepdim=True) 
@@ -512,8 +516,10 @@ def optimize_astro_tile_batched(observed_exposures_lr, psf_kernels_hr, scale_fac
         forward_model.num_frames = len(indices_batch)
         
         predicted_lr, _ = forward_model(latent_z_hr)
-        
-        loss_data = dni_data_criterion(predicted_lr, batch_obs_lr, step)
+
+        # Remplacer : loss_data = dni_data_criterion(predicted_lr, batch_obs_lr, step)
+        # Par le calcul de la MSE brute directe :
+        loss_data = F.mse_loss(predicted_lr, batch_obs_lr)
         loss_tv = tv_criterion(latent_z_hr)
         
         # Somme épurée
