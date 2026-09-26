@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.python-version
+
+# Data and generated outputs
+*.fits
+*.fit
+*.fts
+*.raw
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.log
+*.npy
+*.npz
+*.zip
+
+# Editor / OS
+.vscode/
+.DS_Store
