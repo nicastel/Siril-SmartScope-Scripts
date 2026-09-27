@@ -285,12 +285,59 @@ def gpu_bayer_drizzle_stack_torch(fits_paths, scale=2.0, pixfrac=0.6):
     
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
 
-# Exemple d'appel identique
 if __name__ == "__main__":
-    mes_images_raw_siril = [f"r_bkg_pp_lights_{i:05d}.fit.fz" for i in range(1, 54)]
+    from pathlib import Path
+
+    # 1. Définition des extensions cibles (insensibles à la casse)
+    extensions_valides = {".fit", ".fits", ".fz"}
     
-    # Exécution
-    image_rvb_mac, carte_poids = gpu_bayer_drizzle_stack_torch(mes_images_raw_siril, scale=2.0, pixfrac=0.6)
-    
-    fits.writeto("image_drizzle_torch.fits", image_rvb_mac, overwrite=True)
-    print("Terminé ! Fichier créé sous 'image_drizzle_torch.fits'.")
+    # 2. Scan du répertoire courant pour trouver les fichiers correspondants
+    repertoire_courant = Path(".")
+    fichiers_trouves = []
+
+    for fichier in repertoire_courant.iterdir():
+        # Vérifie si c'est un fichier et s'il commence par 'r_'
+        if fichier.is_file() and fichier.name.lower().startswith("r_"):
+            # Extraction des suffixes (ex: 'light.fits.fz' donne ['.fits', '.fz'])
+            suffixes = [s.lower() for s in fichier.suffixes]
+            
+            # Vérification des patterns demandés :
+            # - se termine par .fit ou .fits
+            # - se termine par .fit.fz ou .fits.fz
+            if len(suffixes) >= 1 and suffixes[-1] in extensions_valides:
+                if suffixes[-1] == ".fz":
+                    # Si c'est un .fz, le suffixe précédent doit être .fit ou .fits
+                    if len(suffixes) >= 2 and suffixes[-2] in {".fit", ".fits"}:
+                        fichiers_trouves.append(str(fichier))
+                else:
+                    # C'est directement un .fit ou .fits
+                    fichiers_trouves.append(str(fichier))
+
+    # Tri alphabétique pour garantir l'ordre de la séquence (important pour Siril)
+    fichiers_trouves.sort()
+
+    # 3. Traitement et exécution
+    if not fichiers_trouves:
+        print("❌ Aucun fichier correspondant trouvé dans le répertoire courant.")
+        print("Vérifiez qu'ils commencent par 'r_' et se terminent par .fit, .fits, .fit.fz ou .fits.fz")
+    else:
+        print(f"🚀 {len(fichiers_trouves)} fichiers FITS détectés pour le Drizzle Stacking.")
+        print(f"Première image : {fichiers_trouves[0]}")
+        print(f"Dernière image  : {fichiers_trouves[-1]}")
+        
+        try:
+            # Exécution de l'algorithme (scale=2.0 et pixfrac=0.6 recommandés)
+            image_couleur, carte_poids = gpu_bayer_drizzle_stack_torch(
+                fichiers_trouves, 
+                scale=2.0, 
+                pixfrac=0.6
+            )
+            
+            # Sauvegarde du résultat final au format FITS
+            nom_sortie = "drizzle_final_output.fits"
+            fits.writeto(nom_sortie, image_couleur, overwrite=True)
+            print(f"🎉 Traitement terminé avec succès ! Image sauvegardée sous : '{nom_sortie}'")
+            
+        except Exception as e:
+            print(f"💥 Une erreur est survenue durant l'empilement : {e}")
+
