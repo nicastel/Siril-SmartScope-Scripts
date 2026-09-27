@@ -251,19 +251,32 @@ def gpu_bayer_drizzle_stack_torch(fits_paths, scale=2.0, pixfrac=0.6):
                 x_overlap = torch.clamp(torch.minimum(out_x, x2) - torch.maximum(out_x - 1.0, x1), min=0.0)
                 weights = x_overlap * y_overlap * valid_mask.float()
 
+                # On n'injecte que là où le poids est positif
                 active_indices = weights > 0
                 if not active_indices.any():
                     continue
 
-                w_active = weights[active_indices]
-                y_idx = out_y[active_indices].long()
-                x_idx = out_x[active_indices].long()
-                flat_spatial_indices = y_idx * W_out + x_idx
-
+                # --- AJOUT DU FILTRE POUR IGNORER LES PIXELS NOIRS (Siril style) ---
+                # On récupère la valeur brute du pixel d'entrée pour les indices actifs
+                # Si le pixel vaut 0.0 (ou moins), on l'exclut du calcul
                 for channel in range(C_curr):
                     flat_channel_input = img_tensor[channel].reshape(-1)
-                    val_active = flat_channel_input[active_indices] * w_active
+                    
+                    # On crée un sous-masque combinant la géométrie ET la valeur non nulle
+                    valid_pixel_mask = active_indices.clone()
+                    valid_pixel_mask[active_indices] = (flat_channel_input[active_indices] > 0.0)
+                    
+                    if not valid_pixel_mask.any():
+                        continue
+                        
+                    w_active = weights[valid_pixel_mask]
+                    val_active = flat_channel_input[valid_pixel_mask] * w_active
+                    
+                    y_idx = out_y[valid_pixel_mask].long()
+                    x_idx = out_x[valid_pixel_mask].long()
+                    flat_spatial_indices = y_idx * W_out + x_idx
 
+                    # Accumulation uniquement des pixels utiles
                     output_accum[channel].view(-1).scatter_add_(0, flat_spatial_indices, val_active)
                     weight_accum[channel].view(-1).scatter_add_(0, flat_spatial_indices, w_active)
 
@@ -271,7 +284,7 @@ def gpu_bayer_drizzle_stack_torch(fits_paths, scale=2.0, pixfrac=0.6):
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
     
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
-    
+
 # Exemple d'appel identique
 if __name__ == "__main__":
     mes_images_raw_siril = [f"r_bkg_pp_lights_{i:05d}.fit.fz" for i in range(1, 54)]
@@ -279,5 +292,5 @@ if __name__ == "__main__":
     # Exécution
     image_rvb_mac, carte_poids = gpu_bayer_drizzle_stack_torch(mes_images_raw_siril, scale=2.0, pixfrac=0.6)
     
-    fits.writeto("image_drizzle_apple_silicon.fits", image_rvb_mac, overwrite=True)
-    print("Terminé ! Fichier créé sous 'image_drizzle_apple_silicon.fits'.")
+    fits.writeto("image_drizzle_torch.fits", image_rvb_mac, overwrite=True)
+    print("Terminé ! Fichier créé sous 'image_drizzle_torch.fits'.")
