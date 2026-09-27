@@ -41,7 +41,7 @@ def get_torch_device() -> torch.device:
 
 def load_fits_fz_single(path):
     """
-    Lecture unitaire ultra-légère. 
+    Lecture unitaire ultra-légère.
     Parcours l'HDUList pour extraire l'image sans duplication mémoire.
     """
     with fits.open(path, mode="readonly", memmap=True) as hdul:
@@ -86,7 +86,7 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
     H_out, W_out = int(H_ref * scale), int(W_ref * scale)
     crpix1_out, crpix2_out = crpix1_ref * scale, crpix2_ref * scale
 
-    # Allocations mémoires strictes sur la carte graphique (ou mémoire unifiée)
+    # Allocations mémoires contrôlées à plat sur l'accélérateur matériel
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     M2_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
@@ -98,7 +98,7 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
     y_in, x_in = torch.meshgrid(torch.arange(H_ref, dtype=torch.float32, device=device), torch.arange(W_ref, dtype=torch.float32, device=device), indexing='ij')
     x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
 
-    # Boucle séquentielle fermée : consommation RAM verrouillée à une seule image
+    # Boucle unique fermée : aucun process enfant, aucune duplication de RAM
     with torch.inference_mode():
         for i, path in enumerate(fits_paths):
             data = load_fits_fz_single(path)
@@ -191,7 +191,7 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
                         weight_accum[channel].view(-1).scatter_add_(0, spatial_idx, w_act)
                         M2_accum[channel].view(-1).scatter_add_(0, spatial_idx, welford_M2_update)
 
-            # Libération agressive de la mémoire à la fin de chaque itération
+            # Nettoyage explicite des tenseurs de l'image traitée à chaque itération
             del img_tensor
             if device.type == "cuda":
                 torch.cuda.empty_cache()
@@ -199,11 +199,14 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
     print("Normalisation finale...")
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
+    # --- ÉGALISATION DES HISTOGRAMMES RVB AVEC SÉCURITÉ 2D ---
     if rgb_equal and C == 3:
         print("⚖️ Égalisation RVB...")
-        masque_intersection_couleur = (weight_accum > 0) & (weight_accum > 0) & (weight_accum > 0)
+        masque_intersection_couleur = (weight_accum[0] > 0) & (weight_accum[1] > 0) & (weight_accum[2] > 0)
         seuil_poids_central = len(fits_paths) * 0.8
-        masque_centre_2d = weight_accum > seuil_poids_central
+        
+        # --- FIXATION DU BUG D'INDEX : Le masque extrait est strictement en 2D via l'index [0] ---
+        masque_centre_2d = weight_accum[0] > seuil_poids_central
         
         if not masque_centre_2d.any():
             masque_centre_2d = masque_intersection_couleur
@@ -224,7 +227,6 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
             final_stack[c] = torch.where(masque_intersection_couleur, final_stack[c], torch.tensor(0.0, device=device))
 
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
-
 if __name__ == "__main__":
     extensions_valides = {".fit", ".fits", ".fz"}
     repertoire_courant = Path(".")
