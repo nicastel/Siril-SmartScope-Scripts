@@ -16,11 +16,12 @@ if sys.platform == "win32":
 
 
 import torch
-import torch.nn.functional as F
 import numpy as np
 from astropy.io import fits
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor
+import os
+from concurrent.futures import ProcessPoolExecutor 
+import traceback 
 
 def get_torch_device() -> torch.device:
     global _dml_device
@@ -38,41 +39,54 @@ def get_torch_device() -> torch.device:
         except Exception:
             pass
     return torch.device('cpu')
-
-def load_fits_fz(path):
-    """Fonction isolée pour décompresser le .fz sur un cœur CPU indépendant."""
+def load_fits_fz_worker(path):
+    """
+    Décompression isolée sur un cœur CPU.
+    Correction stricte de l'indexation de l'HDUList pour éliminer le crash .data.
+    """
     with fits.open(path, mode="readonly") as hdul:
-        # Dans un .fz, la donnée compressée est presque toujours dans l'extension [1]
-        hdu = hdul[1] if len(hdul) > 1 else hdul[0]
+        # --- CORRECTION STRCTURELLE DES COMPRESSIONS RICE (.fz) ---
+        # Si le fichier possède plus d'une extension, l'image est TOUJOURS dans l'index 1.
+        if len(hdul) > 1:
+            hdu = hdul[1]
+        else:
+            hdu = hdul[0]
+            
         img = hdu.data.astype(np.float32)
         header = hdu.header
+        
+        # Sécurisation des axes géométriques 3D [C, H, W]
+        C, H_in, W_in = img.shape
         
         return {
             'img': img,
             'dx': float(header.get('DX', 0.0)),
             'dy': float(header.get('DY', 0.0)),
             'angle_rad': np.radians(float(header.get('ANGLE', 0.0))),
-            'crpix1': float(header.get('CRPIX1', img.shape[2] / 2.0)) - 1.0,
-            'crpix2': float(header.get('CRPIX2', img.shape[1] / 2.0)) - 1.0,
+            'crpix1': float(header.get('CRPIX1', W_in / 2.0)) - 1.0,
+            'crpix2': float(header.get('CRPIX2', H_in / 2.0)) - 1.0,
             'name': Path(path).name
         }
 
-def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sigma_high=3.0, sigma_low=3.0, rgb_equal=True):
+def gpu_bayer_drizzle_stack_multiprocess(fits_paths, scale=1.0, pixfrac=0.7, sigma_high=3.0, sigma_low=3.0, rgb_equal=True):
     device = get_torch_device()
-    print(f"Périphérique : {device} (Optimisé pour Décompression Multi-Cœurs .fz)")
+    print(f"Périphérique : {device} (Mode Streaming Régulé Multi-Processus)")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
 
-    # 1. Chargement de la première image pour l'initialisation globale
-    ref_data = load_fits_fz(fits_paths[0])
+    # Détection des cœurs CPU disponibles
+    nb_coeurs = max(1, os.cpu_count() - 2)
+    print(f"➡️ Max {nb_coeurs} processus CPU simultanés pour décoder le format Rice.")
+
+    # Extraction sécurisée de la première brute de référence
+    ref_data = load_fits_fz_worker(fits_paths[0])
     C, H_ref, W_ref = ref_data['img'].shape
     crpix1_ref, crpix2_ref = ref_data['crpix1'], ref_data['crpix2']
 
     H_out, W_out = int(H_ref * scale), int(W_ref * scale)
     crpix1_out, crpix2_out = crpix1_ref * scale, crpix2_ref * scale
 
-    # Allocations VRAM
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     M2_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
@@ -80,33 +94,26 @@ def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sig
     r = (pixfrac * scale) / 2.0
     max_search = int(np.ceil(r)) + 1
 
-    # Pré-calcul des grilles fixes de base
     y_in, x_in = torch.meshgrid(torch.arange(H_ref, dtype=torch.float32, device=device), torch.arange(W_ref, dtype=torch.float32, device=device), indexing='ij')
     x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
 
-    # 2. Utilisation d'un pool de threads pour paralléliser l'I/O et la décompression CPU
-    # On pré-charge 4 images en avance dans la file d'attente
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        # On lance la décompression asynchrone de toutes les images
-        futures = [executor.submit(load_fits_fz, p) for p in fits_paths]
+    # Itérateur fluide par lots pour éradiquer l'erreur Windows 1450 (Ressources insuffisantes)
+    with ProcessPoolExecutor(max_workers=nb_coeurs) as executor:
+        results_iterator = executor.map(load_fits_fz_worker, fits_paths, chunksize=1)
 
         with torch.inference_mode():
-            for i, future in enumerate(futures):
-                # Récupération des données déjà décompressées par le CPU en arrière-plan
-                data = future.result()
-                
+            for i, data in enumerate(results_iterator):
                 img = data['img']
                 dx, dy, angle_rad = data['dx'], data['dy'], data['angle_rad']
                 crpix1_curr, crpix2_curr = data['crpix1'], data['crpix2']
                 
                 print(f"[{i+1}/{len(fits_paths)}] GPU Stack -> {data['name']}")
 
-                # Envoi immédiat vers la VRAM
-                img_tensor = torch.as_tensor(img, device=device)
+                img_tensor = torch.as_tensor(img, device=device, dtype=torch.float32)
 
-                # Si les dimensions varient à cause d'un recadrage Siril
-                if img.shape[1] != H_ref or img.shape[2] != W_ref:
-                    y_dyn, x_dyn = torch.meshgrid(torch.arange(img.shape[1], device=device), torch.arange(img.shape[2], device=device), indexing='ij')
+                _, H_in, W_in = img.shape
+                if H_in != H_ref or W_in != W_ref:
+                    y_dyn, x_dyn = torch.meshgrid(torch.arange(H_in, dtype=torch.float32, device=device), torch.arange(W_in, dtype=torch.float32, device=device), indexing='ij')
                     xf, yf = x_dyn.reshape(-1), y_dyn.reshape(-1)
                     xc_in = xf - crpix1_curr
                     yc_in = yf - crpix2_curr
@@ -122,7 +129,6 @@ def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sig
                 target_y = yc_out + crpix2_out
                 x1, x2, y1, y2 = target_x - r, target_x + r, target_y - r, target_y + r
 
-                # Accumulation physique Drizzle
                 for dy_pix in range(-max_search, max_search + 1):
                     for dx_pix in range(-max_search, max_search + 1):
                         out_x = torch.round(target_x) + dx_pix
@@ -138,8 +144,8 @@ def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sig
                         active_indices = weights > 0
                         if not active_indices.any(): continue
 
-                        y_idx = out_y[active_indices].long()
-                        x_idx = out_x[active_indices].long()
+                        y_idx = out_y[active_indices].to(torch.int32)
+                        x_idx = out_x[active_indices].to(torch.int32)
                         flat_spatial_indices = y_idx * W_out + x_idx
 
                         for channel in range(C):
@@ -167,7 +173,8 @@ def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sig
 
                             w_act = weights[valid_pixel_mask]
                             val_act = flat_channel_input[valid_pixel_mask]
-                            spatial_idx = out_y[valid_pixel_mask].long() * W_out + out_x[valid_pixel_mask].long()
+                            
+                            spatial_idx = (out_y[valid_pixel_mask].to(torch.int32) * W_out + out_x[valid_pixel_mask].to(torch.int32))
 
                             old_means = output_accum[channel].view(-1)[spatial_idx]
                             old_weights = weight_accum[channel].view(-1)[spatial_idx]
@@ -186,10 +193,17 @@ def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sig
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
     if rgb_equal and C == 3:
-        print("⚖️ Égalisation RVB...")
-        means = [final_stack[c][final_stack[c] > 0.0].mean().item() for c in range(3)]
+        print("⚖️ Égalisation RVB (Suppression de la dominante verte)...")
+        means = []
+        for c in range(3):
+            canal = final_stack[c]
+            mask = canal > 0.0
+            means.append(canal[mask].mean().item() if mask.any() else 1.0)
+        
         k_red = means[1] / max(means[0], 1e-5)
         k_blue = means[1] / max(means[2], 1e-5)
+        
+        print(f"   -> Application de la Balance : R * {k_red:.4f} | B * {k_blue:.4f}")
         final_stack[0] *= k_red
         final_stack[2] *= k_blue
 
@@ -197,6 +211,9 @@ def gpu_bayer_drizzle_stack_fz_optimized(fits_paths, scale=1.0, pixfrac=0.7, sig
 
 
 if __name__ == "__main__":
+    import multiprocessing
+    multiprocessing.freeze_support()
+
     extensions_valides = {".fit", ".fits", ".fz"}
     repertoire_courant = Path(".")
     fichiers_trouves = [
@@ -207,13 +224,16 @@ if __name__ == "__main__":
     fichiers_trouves.sort()
 
     if not fichiers_trouves:
-        print("❌ Aucun fichier trouvé.")
+        print("❌ Aucun fichier trouvé dans le répertoire courant.")
     else:
         try:
             import time
             start_time = time.time()
-            image_couleur, carte_poids = gpu_bayer_drizzle_stack_fz_optimized(fichiers_trouves, scale=1.0, rgb_equal=True)
-            fits.writeto("drizzle_fixed_final.fits", image_couleur, overwrite=True)
-            print(f"🎉 Traitement achevé avec succès en {time.time() - start_time:.2f} secondes !")
+            
+            image_couleur, carte_poids = gpu_bayer_drizzle_stack_multiprocess(fichiers_trouves, scale=1.0, rgb_equal=True)
+            
+            fits.writeto("drizzle_final_perfect.fits", image_couleur, overwrite=True)
+            print(f"🎉 [STREAMING MULTIPROCESS GPU] Traitement achevé en {time.time() - start_time:.2f} secondes !")
         except Exception as e:
-            print(f"💥 Erreur globale : {e}")
+            print("❌ Une erreur est survenue lors du traitement :")
+            traceback.print_exc()
