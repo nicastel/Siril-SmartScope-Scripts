@@ -37,15 +37,16 @@ def get_torch_device() -> torch.device:
             pass
     return torch.device('cpu')
 
-def gpu_bayer_drizzle_stack_one_pass(fits_paths, scale=1.0, pixfrac=0.7, sigma_high=3.0, sigma_low=3.0):
+def gpu_bayer_drizzle_stack_one_pass(fits_paths, scale=1.0, pixfrac=0.7, sigma_high=3.0, sigma_low=3.0, rgb_equal=True):
     """
-    Bayer Drizzle Stacking en UNE SEULE PASSE sur GPU.
-    Utilise une variante de l'algorithme glissant de Welford pour le calcul dynamique du Sigma
-    et rejette les satellites en temps réel à la volée.
+    Bayer Drizzle Stacking en UNE SEULE PASSE sur GPU avec option d'équilibrage RVB.
+    
+    Parameters:
+      rgb_equal: Si True, aligne les histogrammes Rouge et Bleu sur le Vert pour supprimer la dominante verte.
     """
     device = get_torch_device()
     print(f"Périphérique de calcul : {device}")
-    print(f"Mode 1 Passe -> Scale: {scale}x | Pixfrac: {pixfrac} | Rejet Sigma: {sigma_high}")
+    print(f"Mode 1 Passe -> Scale: {scale}x | Pixfrac: {pixfrac} | RVB Égalisé: {rgb_equal}")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
@@ -61,12 +62,8 @@ def gpu_bayer_drizzle_stack_one_pass(fits_paths, scale=1.0, pixfrac=0.7, sigma_h
     crpix1_out = crpix1_ref * scale
     crpix2_out = crpix2_ref * scale
 
-    # Accumulateurs principaux pour le résultat final
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
-
-    # Accumulateurs glissants pour l'évaluation statistique en temps réel (Algorithme de Welford)
-    # n_images tracks the current valid weight/count per pixel location
     M2_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
 
     r = (pixfrac * scale) / 2.0
@@ -86,10 +83,9 @@ def gpu_bayer_drizzle_stack_one_pass(fits_paths, scale=1.0, pixfrac=0.7, sigma_h
             crpix1_curr = float(header.get('CRPIX1', W_in / 2.0)) - 1.0
             crpix2_curr = float(header.get('CRPIX2', H_in / 2.0)) - 1.0
 
-            print(f"[{i+1}/{len(fits_paths)}] Passe Unique (Drizzle + Rejet Flottant) -> {Path(path).name}")
+            print(f"[{i+1}/{len(fits_paths)}] Drizzle + Rejet -> {Path(path).name}")
             img_tensor = torch.tensor(img, dtype=torch.float32, device=device)
 
-        # Génération géométrique
         y_in, x_in = torch.meshgrid(torch.arange(H_in, device=device), torch.arange(W_in, device=device), indexing='ij')
         x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
         xc_out = ( (x_in_flat - crpix1_curr) * np.cos(angle_rad) - (y_in_flat - crpix2_curr) * np.sin(angle_rad) + dx ) * scale
@@ -118,20 +114,13 @@ def gpu_bayer_drizzle_stack_one_pass(fits_paths, scale=1.0, pixfrac=0.7, sigma_h
                     actual_vals = flat_channel_input[active_indices]
                     w_active = weights[active_indices]
 
-                    # Extraction de l'état statistique actuel de la pile pour ces coordonnées
                     current_weights = weight_accum[channel].view(-1)[flat_spatial_indices]
                     current_means = output_accum[channel].view(-1)[flat_spatial_indices]
                     current_M2 = M2_accum[channel].view(-1)[flat_spatial_indices]
 
-                    # Calcul de l'écart-type glissant actuel (σ)
-                    # Si on a moins de 2 images d'historique de poids, on met un sigma par défaut
                     current_sigmas = torch.sqrt(torch.clamp(current_M2 / torch.clamp(current_weights, min=1.0), min=1e-5))
 
-                    # --- REJET STATISTIQUE EN PASSE UNIQUE ---
                     is_not_black = (actual_vals > 0.0)
-                    
-                    # On n'applique le rejet qu'à partir du moment où le pixel a déjà reçu au moins 2 images d'historique
-                    # pour éviter de rejeter les premières poses arbitrairement
                     has_history = (current_weights >= 1.5) 
                     
                     within_bounds = ~has_history | (
@@ -141,37 +130,58 @@ def gpu_bayer_drizzle_stack_one_pass(fits_paths, scale=1.0, pixfrac=0.7, sigma_h
 
                     valid_pixel_mask = active_indices.clone()
                     valid_pixel_mask[active_indices] = is_not_black & within_bounds
-                    
                     if not valid_pixel_mask.any(): continue
 
-                    # Ré-extraction filtrée des pixels acceptés
                     w_act = weights[valid_pixel_mask]
                     val_act = flat_channel_input[valid_pixel_mask]
                     spatial_idx = out_y[valid_pixel_mask].long() * W_out + out_x[valid_pixel_mask].long()
 
-                    # --- MISE À JOUR FORMELLES DE WELFORD ET ACCUMULATION ---
-                    # Version vectorisée des équations glissantes
                     old_means = output_accum[channel].view(-1)[spatial_idx]
                     old_weights = weight_accum[channel].view(-1)[spatial_idx]
                     new_weights = old_weights + w_act
 
-                    # Nouvelle moyenne pondérée glissante
-                    # Moyenne = Moyenne_précédente + (Valeur - Moyenne_précédente) * (Poids_courant / Poids_total)
                     delta = val_act - old_means
                     new_means = old_means + delta * (w_act / torch.clamp(new_weights, min=1e-5))
-
-                    # Mise à jour de la somme des carrés des différences (M2) pour le sigma de la prochaine frame
                     delta2 = val_act - new_means
                     welford_M2_update = w_act * delta * delta2
 
-                    # Injection atomique sur la carte graphique
                     output_accum[channel].view(-1).scatter_add_(0, spatial_idx, val_act * w_act)
                     weight_accum[channel].view(-1).scatter_add_(0, spatial_idx, w_act)
                     M2_accum[channel].view(-1).scatter_add_(0, spatial_idx, welford_M2_update)
 
-    # 3. Normalisation finale
-    print("Normalisation finale de la matrice en passe unique...")
+    print("Normalisation de la matrice...")
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
+
+    # --- CORRECTION DE LA DOMINANTE VERTE (RGB_EQUAL) ---
+    if rgb_equal and C == 3:
+        print("⚖️ Égalisation RVB (Neutralisation du fond vert)...")
+        # On calcule le niveau médian du fond de ciel ou la moyenne des pixels pour chaque canal.
+        # Pour être robuste à la saturation des étoiles, on utilise la moyenne des pixels non nuls de fond
+        for c in range(3):
+            canal_data = final_stack[c]
+            # Masque pour ignorer les pixels noirs de bordure
+            mask_data = canal_data > 0.0
+            if mask_data.any():
+                # Calcul de la valeur moyenne du canal
+                mean_val = canal_data[mask_data].mean()
+                if c == 1:  # Le canal 1 est le Vert (G dans RGB)
+                    mean_green = mean_val
+                elif c == 0:
+                    mean_red = mean_val
+                elif c == 2:
+                    mean_blue = mean_val
+
+        # Calcul des facteurs correctifs basés sur le vert
+        k_red = mean_green / torch.clamp(mean_red, min=1e-5)
+        k_blue = mean_green / torch.clamp(mean_blue, min=1e-5)
+
+        print(f"   -> Facteur Rouge (R) : {k_red.item():.4f}")
+        print(f"   -> Facteur Bleu (B)  : {k_blue.item():.4f}")
+
+        # Application des coefficients multiplicateurs directement sur le GPU
+        final_stack[0] *= k_red
+        final_stack[2] *= k_blue
+
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
 
 # --- BLOC MAIN ---
@@ -190,14 +200,16 @@ if __name__ == "__main__":
         print("❌ Aucun fichier correspondant trouvé.")
     else:
         try:
+            # rgb_equal=True supprime automatiquement le masque vert en équilibrant les histogrammes.
             image_couleur, carte_poids = gpu_bayer_drizzle_stack_one_pass(
                 fichiers_trouves, 
                 scale=1.0, 
                 pixfrac=0.7,
                 sigma_high=3.0,
-                sigma_low=3.0
+                sigma_low=3.0,
+                rgb_equal=True  # <-- L'option demandée est intégrée ici !
             )
             fits.writeto("drizzle_1pass_cleaned.fits", image_couleur, overwrite=True)
-            print("🎉 Image finale sauvegardée avec succès sous : 'drizzle_1pass_cleaned.fits'")
+            print("🎉 Image finale sauvegardée sous : 'drizzle_1pass_cleaned.fits'")
         except Exception as e:
             print(f"💥 Erreur lors de l'exécution : {e}")
