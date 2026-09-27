@@ -20,8 +20,9 @@ import numpy as np
 from astropy.io import fits
 from pathlib import Path
 import os
-from concurrent.futures import ProcessPoolExecutor 
-import traceback 
+import time
+import traceback
+from concurrent.futures import ProcessPoolExecutor
 
 def get_torch_device() -> torch.device:
     global _dml_device
@@ -39,47 +40,43 @@ def get_torch_device() -> torch.device:
         except Exception:
             pass
     return torch.device('cpu')
+
 def load_fits_fz_worker(path):
     """
-    Décompression isolée sur un cœur CPU.
-    Correction stricte de l'indexation de l'HDUList pour éliminer le crash .data.
+    Décompression isolée sur un cœur CPU permanent.
+    Indexation stricte du CompressedImageHDU pour éliminer définitivement l'erreur '.data'.
     """
     with fits.open(path, mode="readonly") as hdul:
-        # --- CORRECTION STRCTURELLE DES COMPRESSIONS RICE (.fz) ---
-        # Si le fichier possède plus d'une extension, l'image est TOUJOURS dans l'index 1.
-        if len(hdul) > 1:
-            hdu = hdul[1]
-        else:
-            hdu = hdul[0]
-            
+        # Dans un fichier .fz, l'image compressée Rice est TOUJOURS dans l'index 1.
+        # Si le fichier est un .fits standard non compressé, elle est dans l'index 0.
+        hdu_idx = 1 if len(hdul) > 1 else 0
+        hdu = hdul[hdu_idx]
+        
         img = hdu.data.astype(np.float32)
         header = hdu.header
-        
-        # Sécurisation des axes géométriques 3D [C, H, W]
-        C, H_in, W_in = img.shape
         
         return {
             'img': img,
             'dx': float(header.get('DX', 0.0)),
             'dy': float(header.get('DY', 0.0)),
             'angle_rad': np.radians(float(header.get('ANGLE', 0.0))),
-            'crpix1': float(header.get('CRPIX1', W_in / 2.0)) - 1.0,
-            'crpix2': float(header.get('CRPIX2', H_in / 2.0)) - 1.0,
+            'crpix1': float(header.get('CRPIX1', img.shape[2] / 2.0)) - 1.0,
+            'crpix2': float(header.get('CRPIX2', img.shape[1] / 2.0)) - 1.0,
             'name': Path(path).name
         }
 
 def gpu_bayer_drizzle_stack_multiprocess(fits_paths, scale=1.0, pixfrac=0.7, sigma_high=3.0, sigma_low=3.0, rgb_equal=True):
     device = get_torch_device()
-    print(f"Périphérique : {device} (Mode Streaming Régulé Multi-Processus)")
+    print(f"Périphérique : {device} (Mode Pool Fixe Haute Vitesse)")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
 
-    # Détection des cœurs CPU disponibles
-    nb_coeurs = max(1, os.cpu_count() - 2)
-    print(f"➡️ Max {nb_coeurs} processus CPU simultanés pour décoder le format Rice.")
+    # Utilisation de la moitié des cœurs pour la sécurité Windows (Anti-Err 1450)
+    nb_coeurs = max(1, (os.cpu_count() or 4) // 2)
+    print(f"➡️ Allocation de {nb_coeurs} processus persistants pour la décompression Rice.")
 
-    # Extraction sécurisée de la première brute de référence
+    # --- CORRECTION STRCTURELLE ICI : Extraction stricte du premier élément de la liste ---
     ref_data = load_fits_fz_worker(fits_paths[0])
     C, H_ref, W_ref = ref_data['img'].shape
     crpix1_ref, crpix2_ref = ref_data['crpix1'], ref_data['crpix2']
@@ -97,7 +94,7 @@ def gpu_bayer_drizzle_stack_multiprocess(fits_paths, scale=1.0, pixfrac=0.7, sig
     y_in, x_in = torch.meshgrid(torch.arange(H_ref, dtype=torch.float32, device=device), torch.arange(W_ref, dtype=torch.float32, device=device), indexing='ij')
     x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
 
-    # Itérateur fluide par lots pour éradiquer l'erreur Windows 1450 (Ressources insuffisantes)
+    # ProcessPoolExecutor permanent régulé par lots de 1
     with ProcessPoolExecutor(max_workers=nb_coeurs) as executor:
         results_iterator = executor.map(load_fits_fz_worker, fits_paths, chunksize=1)
 
@@ -122,8 +119,10 @@ def gpu_bayer_drizzle_stack_multiprocess(fits_paths, scale=1.0, pixfrac=0.7, sig
                     yc_in = y_in_flat - crpix2_curr
 
                 cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-                xc_out = (xc_in * cos_a - yc_in * sin_a + dx) * scale
-                yc_out = (xc_in * sin_a + yc_in * cos_a + dy) * scale
+                
+                # Alignement géométrique inverse Siril strict (Éradication des liserés)
+                xc_out = (xc_in * cos_a - yc_in * sin_a - dx) * scale
+                yc_out = (xc_in * sin_a + yc_in * cos_a - dy) * scale
 
                 target_x = xc_out + crpix1_out
                 target_y = yc_out + crpix2_out
@@ -192,23 +191,30 @@ def gpu_bayer_drizzle_stack_multiprocess(fits_paths, scale=1.0, pixfrac=0.7, sig
     print("Normalisation finale...")
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
+    # --- ÉGALISATION DES HISTOGRAMMES RVB ---
     if rgb_equal and C == 3:
-        print("⚖️ Égalisation RVB (Suppression de la dominante verte)...")
+        print("⚖️ Égalisation RVB...")
+        seuil_poids_central = len(fits_paths) * 0.8
+        
+        # Le masque 2D cible uniquement le canal Vert (1) pour éviter l'IndexError 3D
+        masque_centre_2d = weight_accum[1] > seuil_poids_central
+        
+        if not masque_centre_2d.any():
+            masque_centre_2d = weight_accum[1] > 0.0
+
         means = []
         for c in range(3):
             canal = final_stack[c]
-            mask = canal > 0.0
-            means.append(canal[mask].mean().item() if mask.any() else 1.0)
+            means.append(canal[masque_centre_2d].mean().item() if masque_centre_2d.any() else 1.0)
         
         k_red = means[1] / max(means[0], 1e-5)
         k_blue = means[1] / max(means[2], 1e-5)
         
-        print(f"   -> Application de la Balance : R * {k_red:.4f} | B * {k_blue:.4f}")
+        print(f"   -> Alignement couleur appliqué : R * {k_red:.4f} | B * {k_blue:.4f}")
         final_stack[0] *= k_red
         final_stack[2] *= k_blue
 
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
-
 
 if __name__ == "__main__":
     import multiprocessing
@@ -224,7 +230,7 @@ if __name__ == "__main__":
     fichiers_trouves.sort()
 
     if not fichiers_trouves:
-        print("❌ Aucun fichier trouvé dans le répertoire courant.")
+        print("❌ Aucun fichier trouvé.")
     else:
         try:
             import time
@@ -233,7 +239,7 @@ if __name__ == "__main__":
             image_couleur, carte_poids = gpu_bayer_drizzle_stack_multiprocess(fichiers_trouves, scale=1.0, rgb_equal=True)
             
             fits.writeto("drizzle_final_perfect.fits", image_couleur, overwrite=True)
-            print(f"🎉 [STREAMING MULTIPROCESS GPU] Traitement achevé en {time.time() - start_time:.2f} secondes !")
+            print(f"🎉 [POOL MULTIPROCESS GPU] Traitement achevé en {time.time() - start_time:.2f} secondes !")
         except Exception as e:
-            print("❌ Une erreur est survenue lors du traitement :")
+            print("❌ Erreur lors du traitement :", str(e))
             traceback.print_exc()
