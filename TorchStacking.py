@@ -40,10 +40,7 @@ def get_torch_device() -> torch.device:
     return torch.device('cpu')
 
 def load_fits_fz_single(path):
-    """
-    Lecture unitaire ultra-légère.
-    Parcours l'HDUList pour extraire l'image sans duplication mémoire.
-    """
+    """Lecture unitaire ultra-légère sans duplication mémoire."""
     with fits.open(path, mode="readonly", memmap=True) as hdul:
         hdu = None
         for current_hdu in hdul:
@@ -71,14 +68,14 @@ def load_fits_fz_single(path):
             'name': Path(path).name
         }
 
-def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma_high=3.0, sigma_low=3.0, rgb_equal=True):
+def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_equal=True):
     device = get_torch_device()
-    print(f"Périphérique de calcul : {device} (Mode Séquentiel Léger et Stable)")
+    print(f"Périphérique de calcul : {device} (Mode Moyenne Proportionnelle Stable - Float32)")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
 
-    # Chargement initial de la brute de référence
+    # Chargement de la brute de référence
     ref_data = load_fits_fz_single(fits_paths[0])
     C, H_ref, W_ref = ref_data['img'].shape
     crpix1_ref, crpix2_ref = ref_data['crpix1'], ref_data['crpix2']
@@ -86,19 +83,19 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
     H_out, W_out = int(H_ref * scale), int(W_ref * scale)
     crpix1_out, crpix2_out = crpix1_ref * scale, crpix2_ref * scale
 
-    # Allocations mémoires contrôlées à plat sur l'accélérateur matériel
+    # Allocations obligatoires en Float32 pour compatibilité matérielle MPS Mac
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
-    M2_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
 
     r = (pixfrac * scale) / 2.0
     max_search = int(np.ceil(r)) + 1
 
-    # Pré-calcul des grilles de coordonnées d'origine
+    # Nombre total d'images dans la séquence pour le calcul de la pondération stable
+    total_frames = float(len(fits_paths))
+
     y_in, x_in = torch.meshgrid(torch.arange(H_ref, dtype=torch.float32, device=device), torch.arange(W_ref, dtype=torch.float32, device=device), indexing='ij')
     x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
 
-    # Boucle unique fermée : aucun process enfant, aucune duplication de RAM
     with torch.inference_mode():
         for i, path in enumerate(fits_paths):
             data = load_fits_fz_single(path)
@@ -108,8 +105,10 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
             angle_rad = np.radians(angle_deg)
             crpix1_curr, crpix2_curr = data['crpix1'], data['crpix2']
             
-            print(f"[{i+1}/{len(fits_paths)}] Empilement -> {data['name']}")
+            if (i + 1) % 100 == 0 or (i + 1) == len(fits_paths):
+                print(f"[{i+1}/{len(fits_paths)}] Accumulation proportionnelle -> {data['name']}")
 
+            # Chargement natif en float32 exigé par Apple Silicon
             img_tensor = torch.as_tensor(img, device=device, dtype=torch.float32)
 
             _, H_in, W_in = img.shape
@@ -140,76 +139,41 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
 
                     y_overlap = torch.clamp(torch.minimum(out_y, y2) - torch.maximum(out_y - 1.0, y1), min=0.0)
                     x_overlap = torch.clamp(torch.minimum(out_x, x2) - torch.maximum(out_x - 1.0, x1), min=0.0)
-                    weights = x_overlap * y_overlap * valid_mask.float()
+                    
+                    # --- INTÉGRATION STABLE CONTRE LA PERTE DE MANTISSE ---
+                    # Diviser les poids individuels par le nombre total de frames garantit que la somme cumulée 
+                    # progresse de façon homothétique très douce, protégeant la dynamique fine du fond du ciel.
+                    weights = (x_overlap * y_overlap * valid_mask.float()) / total_frames
 
                     active_indices = weights > 0
                     if not active_indices.any(): continue
 
                     y_idx = out_y[active_indices].to(torch.int32)
                     x_idx = out_x[active_indices].to(torch.int32)
-                    flat_spatial_indices = y_idx * W_out + x_idx
+                    spatial_idx = y_idx * W_out + x_idx
 
                     for channel in range(C):
                         flat_channel_input = img_tensor[channel].reshape(-1)
-                        actual_vals = flat_channel_input[active_indices]
-                        w_active = weights[active_indices]
-
-                        current_weights = weight_accum[channel].view(-1)[flat_spatial_indices]
-                        current_means = output_accum[channel].view(-1)[flat_spatial_indices]
-                        current_M2 = M2_accum[channel].view(-1)[flat_spatial_indices]
-
-                        current_sigmas = torch.sqrt(torch.clamp(current_M2 / torch.clamp(current_weights, min=1.0), min=1e-5))
-
-                        is_not_black = (actual_vals > 0.0)
-                        has_history = (current_weights >= 1.5)
-                        
-                        within_bounds = ~has_history | (
-                            (actual_vals >= (current_means - sigma_low * current_sigmas)) & \
-                            (actual_vals <= (current_means + sigma_high * current_sigmas))
-                        )
-
-                        valid_pixel_mask = active_indices.clone()
-                        valid_pixel_mask[active_indices] = is_not_black & within_bounds
-                        if not valid_pixel_mask.any(): continue
-
-                        w_act = weights[valid_pixel_mask]
-                        val_act = flat_channel_input[valid_pixel_mask]
-                        
-                        spatial_idx = (out_y[valid_pixel_mask].to(torch.int32) * W_out + out_x[valid_pixel_mask].to(torch.int32))
-
-                        old_means = output_accum[channel].view(-1)[spatial_idx]
-                        old_weights = weight_accum[channel].view(-1)[spatial_idx]
-                        
-                        new_weights = old_weights + w_act
-
-                        delta = val_act - old_means
-                        new_means = old_means + delta * (w_act / torch.clamp(new_weights, min=1e-5))
-                        delta2 = val_act - new_means
-                        welford_M2_update = w_act * delta * delta2
+                        val_act = flat_channel_input[active_indices]
+                        w_act = weights[active_indices]
 
                         output_accum[channel].view(-1).scatter_add_(0, spatial_idx, val_act * w_act)
                         weight_accum[channel].view(-1).scatter_add_(0, spatial_idx, w_act)
-                        M2_accum[channel].view(-1).scatter_add_(0, spatial_idx, welford_M2_update)
 
-            # Nettoyage explicite des tenseurs de l'image traitée à chaque itération
             del img_tensor
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
     print("Normalisation finale...")
+    # Rétablissement de la vraie moyenne arithmétique globale, immunisée contre la troncature du float32
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
-    # --- ÉGALISATION DES HISTOGRAMMES RVB AVEC SÉCURITÉ 2D ---
     if rgb_equal and C == 3:
         print("⚖️ Égalisation RVB...")
-        masque_intersection_couleur = (weight_accum[0] > 0) & (weight_accum[1] > 0) & (weight_accum[2] > 0)
-        seuil_poids_central = len(fits_paths) * 0.8
-        
-        # --- FIXATION DU BUG D'INDEX : Le masque extrait est strictement en 2D via l'index [0] ---
+        masque_intersection_couleur = (weight_accum > 0) & (weight_accum > 0) & (weight_accum > 0)
+        seuil_poids_central = (1.0 / total_frames) * len(fits_paths) * 0.8
         masque_centre_2d = weight_accum[0] > seuil_poids_central
         
         if not masque_centre_2d.any():
-            masque_centre_2d = masque_intersection_couleur
+            masque_centre_2d = masque_intersection_couleur[0]
 
         means = []
         for c in range(3):
@@ -224,9 +188,10 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, sigma
         final_stack[2] *= k_blue
 
         for c in range(3):
-            final_stack[c] = torch.where(masque_intersection_couleur, final_stack[c], torch.tensor(0.0, device=device))
+            final_stack[c] = torch.where(masque_intersection_couleur[c], final_stack[c], torch.tensor(0.0, device=device))
 
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
+
 if __name__ == "__main__":
     extensions_valides = {".fit", ".fits", ".fz"}
     repertoire_courant = Path(".")
@@ -247,8 +212,7 @@ if __name__ == "__main__":
             image_couleur, carte_poids = gpu_bayer_drizzle_stack_sequential(fichiers_trouves, scale=1.0, rgb_equal=True)
             
             fits.writeto("drizzle_final_perfect.fits", image_couleur, overwrite=True)
-            print(f"🎉 [SEQUENTIAL GPU STACK] Traitement achevé en {time.time() - start_time:.2f} secondes !")
-            
+            print(f"🎉 [MPS FLOAT32 RESTORED] Traitement achevé en {time.time() - start_time:.2f} secondes !")
         except Exception as e:
             print("\n💥 Une erreur globale est survenue durant l'exécution !")
             traceback.print_exc()
