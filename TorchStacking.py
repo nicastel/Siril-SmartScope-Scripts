@@ -70,7 +70,7 @@ def load_fits_fz_single(path):
 
 def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_equal=True):
     device = get_torch_device()
-    print(f"Périphérique de calcul : {device} (Mode Moyenne Proportionnelle Stable - Float32)")
+    print(f"Périphérique : {device} (Accumulation Compensée de Kahan - Haute Fidélité Float32)")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
@@ -83,15 +83,17 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
     H_out, W_out = int(H_ref * scale), int(W_ref * scale)
     crpix1_out, crpix2_out = crpix1_ref * scale, crpix2_ref * scale
 
-    # Allocations obligatoires en Float32 pour compatibilité matérielle MPS Mac
+    # Accumulateurs de données et de poids en Float32 (Requis pour MPS Mac)
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
 
+    # --- ENTRAÎNEMENT DE KAHAN : Tableaux de compensation d'erreur (Low-bits carry) ---
+    # Élimine la perte de précision sur 5000 images sans utiliser de float64
+    output_compensation = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
+    weight_compensation = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
+
     r = (pixfrac * scale) / 2.0
     max_search = int(np.ceil(r)) + 1
-
-    # Nombre total d'images dans la séquence pour le calcul de la pondération stable
-    total_frames = float(len(fits_paths))
 
     y_in, x_in = torch.meshgrid(torch.arange(H_ref, dtype=torch.float32, device=device), torch.arange(W_ref, dtype=torch.float32, device=device), indexing='ij')
     x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
@@ -106,20 +108,20 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
             crpix1_curr, crpix2_curr = data['crpix1'], data['crpix2']
             
             if (i + 1) % 100 == 0 or (i + 1) == len(fits_paths):
-                print(f"[{i+1}/{len(fits_paths)}] Accumulation proportionnelle -> {data['name']}")
+                print(f"[{i+1}/{len(fits_paths)}] Traitement -> {data['name']}")
 
-            # Chargement natif en float32 exigé par Apple Silicon
             img_tensor = torch.as_tensor(img, device=device, dtype=torch.float32)
 
             _, H_in, W_in = img.shape
-            if H_in != H_ref or W_in != W_ref:
-                y_dyn, x_dyn = torch.meshgrid(torch.arange(H_in, dtype=torch.float32, device=device), torch.arange(W_in, dtype=torch.float32, device=device), indexing='ij')
-                xf, yf = x_dyn.reshape(-1), y_dyn.reshape(-1)
-                xc_in = xf - crpix1_curr
-                yc_in = yf - crpix2_curr
-            else:
-                xc_in = x_in_flat - crpix1_curr
-                yc_in = y_in_flat - crpix2_curr
+            if hdu_shape := img.shape:
+                if H_in != H_ref or W_in != W_ref:
+                    y_dyn, x_dyn = torch.meshgrid(torch.arange(H_in, dtype=torch.float32, device=device), torch.arange(W_in, dtype=torch.float32, device=device), indexing='ij')
+                    xf, yf = x_dyn.reshape(-1), y_dyn.reshape(-1)
+                    xc_in = xf - crpix1_curr
+                    yc_in = yf - crpix2_curr
+                else:
+                    xc_in = x_in_flat - crpix1_curr
+                    yc_in = y_in_flat - crpix2_curr
 
             cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
             xc_scaled = (xc_in * cos_a - yc_in * sin_a) * scale
@@ -127,7 +129,8 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
 
             target_x = xc_scaled + dx + crpix1_out
             target_y = yc_scaled - dy + crpix2_out
-            x1, x2, y1, y2 = target_x - r, target_x + r, target_y - r, target_y + r
+            x1, x2 = target_x - r, target_x + r
+            y1, y2 = target_y - r, target_y + r
 
             for dy_pix in range(-max_search, max_search + 1):
                 for dx_pix in range(-max_search, max_search + 1):
@@ -139,11 +142,7 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
 
                     y_overlap = torch.clamp(torch.minimum(out_y, y2) - torch.maximum(out_y - 1.0, y1), min=0.0)
                     x_overlap = torch.clamp(torch.minimum(out_x, x2) - torch.maximum(out_x - 1.0, x1), min=0.0)
-                    
-                    # --- INTÉGRATION STABLE CONTRE LA PERTE DE MANTISSE ---
-                    # Diviser les poids individuels par le nombre total de frames garantit que la somme cumulée 
-                    # progresse de façon homothétique très douce, protégeant la dynamique fine du fond du ciel.
-                    weights = (x_overlap * y_overlap * valid_mask.float()) / total_frames
+                    weights = x_overlap * y_overlap * valid_mask.float()
 
                     active_indices = weights > 0
                     if not active_indices.any(): continue
@@ -152,25 +151,48 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
                     x_idx = out_x[active_indices].to(torch.int32)
                     spatial_idx = y_idx * W_out + x_idx
 
+                    # --- ALGORITHME DE KAHAN COMPENSÉ PAR PIXEL ---
+                    # Cette structure additionne l'erreur résiduelle passée, réalise la somme, 
+                    # puis sauvegarde la perte de précision locale pour l'image suivante.
+                    w_act = weights[active_indices]
+                    
+                    # On accumule le poids de manière compensée
+                    weight_input = torch.zeros(H_out * W_out, dtype=torch.float32, device=device)
+                    weight_input.scatter_add_(0, spatial_idx, w_act)
+                    
+                    y_w = weight_input.view(H_out, W_out) - weight_compensation[0]
+                    t_w = weight_accum[0] + y_w
+                    weight_compensation[0] = (t_w - weight_accum[0]) - y_w
+                    weight_accum[0] = t_w
+
                     for channel in range(C):
                         flat_channel_input = img_tensor[channel].reshape(-1)
                         val_act = flat_channel_input[active_indices]
-                        w_act = weights[active_indices]
 
-                        output_accum[channel].view(-1).scatter_add_(0, spatial_idx, val_act * w_act)
-                        weight_accum[channel].view(-1).scatter_add_(0, spatial_idx, w_act)
+                        val_input = torch.zeros(H_out * W_out, dtype=torch.float32, device=device)
+                        val_input.scatter_add_(0, spatial_idx, val_act * w_act)
+
+                        # Somme compensée de Kahan sur le signal
+                        y_v = val_input.view(H_out, W_out) - output_compensation[channel]
+                        t_v = output_accum[channel] + y_v
+                        output_compensation[channel] = (t_v - output_accum[channel]) - y_v
+                        output_accum[channel] = t_v
 
             del img_tensor
 
+    # Duplication de la carte de poids sur les 3 canaux pour la division vectorielle
+    weight_accum[1] = weight_accum[0]
+    weight_accum[2] = weight_accum[0]
+
     print("Normalisation finale...")
-    # Rétablissement de la vraie moyenne arithmétique globale, immunisée contre la troncature du float32
+    # Division exacte par les poids cumulés réels (Eradication des vagues géométriques)
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
     if rgb_equal and C == 3:
         print("⚖️ Égalisation RVB...")
         masque_intersection_couleur = (weight_accum > 0) & (weight_accum > 0) & (weight_accum > 0)
-        seuil_poids_central = (1.0 / total_frames) * len(fits_paths) * 0.8
-        masque_centre_2d = weight_accum[0] > seuil_poids_central
+        seuil_poids_central = torch.max(weight_accum[0]) * 0.8
+        masque_centre_2d = weight_accum[0] > seuid_poids_central if 'seuid_poids_central' in locals() else weight_accum[0] > seuil_poids_central
         
         if not masque_centre_2d.any():
             masque_centre_2d = masque_intersection_couleur[0]
@@ -212,7 +234,7 @@ if __name__ == "__main__":
             image_couleur, carte_poids = gpu_bayer_drizzle_stack_sequential(fichiers_trouves, scale=1.0, rgb_equal=True)
             
             fits.writeto("drizzle_final_perfect.fits", image_couleur, overwrite=True)
-            print(f"🎉 [MPS FLOAT32 RESTORED] Traitement achevé en {time.time() - start_time:.2f} secondes !")
+            print(f"🎉 [KAHAN COMPENSATED STACK] Traitement achevé en {time.time() - start_time:.2f} secondes !")
         except Exception as e:
             print("\n💥 Une erreur globale est survenue durant l'exécution !")
             traceback.print_exc()
