@@ -19,6 +19,7 @@
 # Imports
 # ------------------------------------------------------------------------------
 import os
+import json
 
 import sirilpy as s
 
@@ -32,18 +33,30 @@ try:
 except SirilConnectionError as e:
     print(f"Connection failed: {e}")
 
+target_name = None
+try:
+    with open("manifest.json", "r", encoding="utf-8") as file:
+        data = json.load(file)
+        target_name = data.get("nameTarget")
+except FileNotFoundError:
+    # 3. Message affiché uniquement si le fichier n'existe pas
+    print("Warning : the file 'manifest.json' is not found. OBJECT header not set")
+
+
 for file in os.listdir(siril.get_siril_wd()):
     if not file.startswith(".") and ( file.endswith(".fits") or file.endswith(".fit") ):
         print("Fixing "+file)
         data, hdr = fits.getdata(file, header=True)
         if hdr.get("FOVRA") is not None:
-            hdr.set(
-                "RA", hdr["FOVRA"]
-            )  # add a RA header based on the FOVRA unistellar header
-            hdr.set(
-                "DEC", hdr["FOVDEC"]
-            )  # add a DEC header based on the FOVDEC unistellar header
-        if hdr.get("CMOSTEMP") is not None:
+            if hdr.get("RA") is None:
+                hdr.set(
+                    "RA", hdr["FOVRA"]
+                )  # add a RA header based on the FOVRA unistellar header
+            if hdr.get("DEC") is None:
+                hdr.set(
+                    "DEC", hdr["FOVDEC"]
+                )  # add a DEC header based on the FOVDEC unistellar header
+        if hdr.get("CMOSTEMP") is not None and hdr.get("CCDTEMP") is None :
                 hdr.set(
                     "CCDTEMP", hdr["CMOSTEMP"]
                 )  # add a CCDTEMP header based on the CMOSTEMP unistellar header
@@ -56,6 +69,7 @@ for file in os.listdir(siril.get_siril_wd()):
             hdr.set("XBINNING", 1) # add a XBINNING header
             hdr.set("YBINNING", 1) # add a YBINNING header
             telescope = "eVscope v1.0"
+
         if hdr["INSTRUME"].startswith("IMX347"):  # eVscope2 or eQuinox2
             hdr.set("FOCALLEN", 450.0)  # add a FOCALLEN header
             hdr.set("XPIXSZ", 2.9)  # add a XPIXSZ header
@@ -64,6 +78,7 @@ for file in os.listdir(siril.get_siril_wd()):
             hdr.set("XBINNING", 1) # add a XBINNING header
             hdr.set("YBINNING", 1) # add a YBINNING header
             telescope = "eVscope v2.0"
+
         if hdr["INSTRUME"].startswith("IMX415"):  # Odyssey or Odyssey Pro
             hdr.set("FOCALLEN", 320.0)  # add a FOCALLEN header
             hdr.set("XPIXSZ", 1.45)  # add a XPIXSZ header
@@ -77,10 +92,15 @@ for file in os.listdir(siril.get_siril_wd()):
             hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
             hdr.set("YBAYROFF", 1)  # add a YPIXSZ header
         else :
-            hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
-            hdr.set("YBAYROFF", 0)  # add a YPIXSZ header
-        if telescope is not None and hdr.get("TELESCOP") is not None:
+            if hdr.get("XBAYROFF") is None :
+                hdr.set("XBAYROFF", 0)  # add a XPIXSZ header
+            if hdr.get("YBAYROFF") is None :
+                hdr.set("YBAYROFF", 0)  # add a YPIXSZ header
+
+        if telescope is not None and hdr.get("TELESCOP") is None:
             hdr.set("TELESCOP", telescope)  # add a TELESCOP header for older FW version
+        if target_name is not None and hdr.get("OBJECT") is None:
+            hdr.set("OBJECT", target_name)  # add a OBJECT header
 
         fits.writeto(file, data, hdr, overwrite=True)
         print(file+" header fixed")
