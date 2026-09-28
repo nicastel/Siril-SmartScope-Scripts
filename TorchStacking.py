@@ -41,32 +41,24 @@ def get_torch_device() -> torch.device:
     return torch.device('cpu')
 
 def load_fits_fz_single(path):
-    """Lecture unitaire ultra-légère et égalisation d'offset (Sky Matching) par percentile bas."""
+    """Lecture unitaire brute ultra-rapide (ZÉRO normalisation)."""
     with fits.open(path, mode="readonly", memmap=True) as hdul:
         hdu = None
         for current_hdu in hdul:
             if current_hdu.data is not None and isinstance(current_hdu.data, np.ndarray) and current_hdu.data.ndim >= 2:
                 hdu = current_hdu
                 break
-        
+
         if hdu is None:
             raise ValueError(f"Aucune matrice d'image valide trouvée dans le fichier FITS : {path}")
-            
+
         img = hdu.data.astype(np.float32)
         header = hdu.header
-        
         C, H_in, W_in = img.shape
-        
-        # Normalisation par percentile bas pour exclure l'éclat des nébuleuses étendues (M42)
-        target_bg = 0.02
-        for c in range(C):
-            channel_data = img[c]
-            low_sky_bg = np.percentile(channel_data, 10.0)
-            img[c] = (channel_data - low_sky_bg) + target_bg
-            
+
         crpix1 = float(header.get('CRPIX1', W_in / 2.0)) - 1.0
         crpix2 = float(header.get('CRPIX2', H_in / 2.0)) - 1.0
-        
+
         return {
             'img': img,
             'dx': float(header.get('DX', 0.0)),
@@ -77,31 +69,30 @@ def load_fits_fz_single(path):
             'name': Path(path).name
         }
 
-def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_equal=True):
+def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0):
     device = get_torch_device()
-    print(f"Périphérique : {device} (Mode Canvas Dynamique 1-Passe | pixfrac=1.0)")
+    print(f"Périphérique : {device} (Mode Linéaire Brut 1-Passe | pixfrac=1.0)")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
 
-    # --- CORRECTION CRITIQUE : Indexation du premier élément de la liste ---
+    # 1. Initialisation sur la première image
     ref_data = load_fits_fz_single(fits_paths[0])
     C, H_ref, W_ref = ref_data['img'].shape
-    
+
     H_out, W_out = int(H_ref * scale), int(W_ref * scale)
-    
+
     x_offset_canvas = 0
     y_offset_canvas = 0
     crpix1_out = ref_data['crpix1'] * scale
     crpix2_out = ref_data['crpix2'] * scale
 
+    # Accumulateurs simplifiés en float32
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
-    output_compensation = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
-    weight_compensation = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
 
     r = (pixfrac * scale) / 2.0
-    max_search = 1 
+    max_search = 1
 
     with torch.inference_mode():
         for i, path in enumerate(fits_paths):
@@ -110,9 +101,9 @@ def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_eq
             dx, dy, angle_deg = data['dx'], data['dy'], data['angle_deg']
             angle_rad = np.radians(angle_deg)
             crpix1_curr, crpix2_curr = data['crpix1'], data['crpix2']
-            
+
             if (i + 1) % 100 == 0 or (i + 1) == len(fits_paths):
-                print(f"[{i+1}/{len(fits_paths)}] Empilement et expansion en VRAM -> {data['name']}")
+                print(f"[{i+1}/{len(fits_paths)}] Empilement linéaire -> {data['name']}")
 
             img_tensor = torch.as_tensor(img, device=device, dtype=torch.float32)
             _, H_in, W_in = img.shape
@@ -130,7 +121,7 @@ def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_eq
             target_x = xc_scaled + ((dx + x_offset_canvas) * scale) + crpix1_out
             target_y = yc_scaled - ((dy - y_offset_canvas) * scale) + crpix2_out
 
-            # --- EXPANSION DE LA TOILE À LA VOLÉE ---
+            # --- EXPANSION DE LA TOILE À LA VOLÉE SUR LE GPU ---
             min_x_need = int(torch.floor(target_x.min()).item()) - max_search
             max_x_need = int(torch.ceil(target_x.max()).item()) + max_search
             min_y_need = int(torch.floor(target_y.min()).item()) - max_search
@@ -146,12 +137,10 @@ def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_eq
                 y_offset_canvas += pad_top
                 crpix1_out += pad_left
                 crpix2_out += pad_top
-                
+
                 output_accum = F.pad(output_accum, (pad_left, pad_right, pad_top, pad_bottom))
                 weight_accum = F.pad(weight_accum, (pad_left, pad_right, pad_top, pad_bottom))
-                output_compensation = F.pad(output_compensation, (pad_left, pad_right, pad_top, pad_bottom))
-                weight_compensation = F.pad(weight_compensation, (pad_left, pad_right, pad_top, pad_bottom))
-                
+
                 H_out, W_out = output_accum.shape[1:]
                 target_x += pad_left
                 target_y += pad_top
@@ -164,7 +153,7 @@ def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_eq
                 valid_y = (out_y >= 0) & (out_y < H_out)
                 if not valid_y.any(): continue
                 y_overlap = torch.clamp(torch.minimum(out_y, y2) - torch.maximum(out_y - 1.0, y1), min=0.0)
-                
+
                 for dx_pix in range(-max_search, max_search + 1):
                     out_x = torch.round(target_x) + dx_pix
                     valid_mask = valid_y & (out_x >= 0) & (out_x < W_out)
@@ -179,56 +168,23 @@ def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_eq
                     spatial_idx = out_y[active_indices].to(torch.int32) * W_out + out_x[active_indices].to(torch.int32)
                     w_act = weights[active_indices]
 
+                    # Somme brute directe ultra-rapide par canal
                     for channel in range(C):
                         flat_channel_input = img_tensor[channel].reshape(-1)
                         val_act = flat_channel_input[active_indices]
 
-                        weight_input = torch.zeros(H_out * W_out, dtype=torch.float32, device=device)
-                        weight_input.scatter_add_(0, spatial_idx, w_act)
-                        
-                        y_w = weight_input.view(H_out, W_out) - weight_compensation[channel]
-                        t_w = weight_accum[channel] + y_w
-                        weight_compensation[channel] = (t_w - weight_accum[channel]) - y_w
-                        weight_accum[channel] = t_w
-
-                        val_input = torch.zeros(H_out * W_out, dtype=torch.float32, device=device)
-                        val_input.scatter_add_(0, spatial_idx, val_act * w_act)
-
-                        y_v = val_input.view(H_out, W_out) - output_compensation[channel]
-                        t_v = output_accum[channel] + y_v
-                        output_compensation[channel] = (t_v - output_accum[channel]) - y_v
-                        output_accum[channel] = t_v
+                        output_accum[channel].view(-1).scatter_add_(0, spatial_idx, val_act * w_act)
+                        weight_accum[channel].view(-1).scatter_add_(0, spatial_idx, w_act)
 
             del img_tensor
 
     print("Normalisation finale...")
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
-    if rgb_equal and C == 3:
-        print("⚖️ Égalisation RVB finale...")
-        masque_intersection_couleur = (weight_accum > 0) & (weight_accum > 0) & (weight_accum > 0)
-        
-        # --- FIXATION DU BUG D'INDEX : Isolement du premier canal pour forcer un masque 2D ---
-        seuil_poids_central = torch.max(weight_accum) * 0.8
-        masque_centre_2d = weight_accum[0] > seuil_poids_central
-
-        if not masque_centre_2d.any():
-            masque_centre_2d = masque_intersection_couleur[0]
-
-        means = []
-        for c in range(3):
-            canal = final_stack[c]
-            means.append(canal[masque_centre_2d].mean().item() if masque_centre_2d.any() else 1.0)
-        
-        k_red = means[1] / max(means[0], 1e-5)
-        k_blue = means[1] / max(means[2], 1e-5)
-        
-        print(f"   -> Alignement couleur appliqué : R * {k_red:.4f} | B * {k_blue:.4f}")
-        final_stack[0] *= k_red
-        final_stack[2] *= k_blue
-
-        for c in range(3):
-            final_stack[c] = torch.where(masque_intersection_couleur[c], final_stack[c], torch.tensor(0.0, device=device))
+    # Masquage simple des bords de dither non-communs pour garder l'image propre
+    masque_intersection = (weight_accum[0] > 0) & (weight_accum[1] > 0) & (weight_accum[2] > 0)
+    for c in range(C):
+        final_stack[c] = torch.where(masque_intersection, final_stack[c], torch.tensor(0.0, device=device))
 
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
 
@@ -237,7 +193,7 @@ if __name__ == "__main__":
     repertoire_courant = Path(".")
     fichiers_trouves = [
         str(f) for f in repertoire_courant.iterdir()
-        if f.is_file() and f.name.lower().startswith("r_") and 
+        if f.is_file() and f.name.lower().startswith("r_") and
         (f.suffixes[-1].lower() in extensions_valides or (len(f.suffixes) >= 2 and f.suffixes[-1].lower() == ".fz" and f.suffixes[-2].lower() in {".fit", ".fits"}))
     ]
     fichiers_trouves.sort()
@@ -248,9 +204,9 @@ if __name__ == "__main__":
         try:
             import time
             start_time = time.time()
-            image_couleur, carte_poids = gpu_linear_dynamic_boundary_stack(fichiers_trouves, scale=1.0, pixfrac=1.0, rgb_equal=True)
+            image_couleur, carte_poids = gpu_linear_dynamic_boundary_stack(fichiers_trouves, scale=1.0, pixfrac=1.0)
             fits.writeto("drizzle_final_maximum_boundary.fits", image_couleur, overwrite=True)
-            print(f"🎉 [MAXIMUM BOUNDARY COMPLETE] Traitement achevé en {time.time() - start_time:.2f} secondes !")
+            print(f"🎉 [BRUT LINEAR STACK COMPLETE] Traitement achevé en {time.time() - start_time:.2f} secondes !")
         except Exception as e:
             print("\n💥 Une erreur globale est survenue durant l'exécution !")
             traceback.print_exc()
