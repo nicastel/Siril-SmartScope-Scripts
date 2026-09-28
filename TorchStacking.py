@@ -16,6 +16,7 @@ if sys.platform == "win32":
 
 
 import torch
+import torch.nn.functional as F
 import numpy as np
 from astropy.io import fits
 from pathlib import Path
@@ -40,7 +41,7 @@ def get_torch_device() -> torch.device:
     return torch.device('cpu')
 
 def load_fits_fz_single(path):
-    """Lecture unitaire ultra-légère sans duplication mémoire."""
+    """Lecture unitaire ultra-légère et égalisation d'offset (Sky Matching) par percentile bas."""
     with fits.open(path, mode="readonly", memmap=True) as hdul:
         hdu = None
         for current_hdu in hdul:
@@ -55,6 +56,14 @@ def load_fits_fz_single(path):
         header = hdu.header
         
         C, H_in, W_in = img.shape
+        
+        # Normalisation par percentile bas pour exclure l'éclat des nébuleuses étendues (M42)
+        target_bg = 0.02
+        for c in range(C):
+            channel_data = img[c]
+            low_sky_bg = np.percentile(channel_data, 10.0)
+            img[c] = (channel_data - low_sky_bg) + target_bg
+            
         crpix1 = float(header.get('CRPIX1', W_in / 2.0)) - 1.0
         crpix2 = float(header.get('CRPIX2', H_in / 2.0)) - 1.0
         
@@ -68,67 +77,85 @@ def load_fits_fz_single(path):
             'name': Path(path).name
         }
 
-def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_equal=True):
+def gpu_linear_dynamic_boundary_stack(fits_paths, scale=1.0, pixfrac=1.0, rgb_equal=True):
     device = get_torch_device()
-    print(f"Périphérique : {device} (Normalisation par Canaux Indépendants - Mode Multi-Weight)")
+    print(f"Périphérique : {device} (Mode Canvas Dynamique 1-Passe | pixfrac=1.0)")
 
     if not fits_paths:
         raise ValueError("La liste des fichiers FITS est vide.")
 
-    # Chargement de la brute de référence
+    # --- CORRECTION CRITIQUE : Indexation du premier élément de la liste ---
     ref_data = load_fits_fz_single(fits_paths[0])
     C, H_ref, W_ref = ref_data['img'].shape
-    crpix1_ref, crpix2_ref = ref_data['crpix1'], ref_data['crpix2']
-
+    
     H_out, W_out = int(H_ref * scale), int(W_ref * scale)
-    crpix1_out, crpix2_out = crpix1_ref * scale, crpix2_ref * scale
+    
+    x_offset_canvas = 0
+    y_offset_canvas = 0
+    crpix1_out = ref_data['crpix1'] * scale
+    crpix2_out = ref_data['crpix2'] * scale
 
-    # Allocations mémoires Float32 requises par MPS Mac
     output_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_accum = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
-
-    # Tableaux de compensation d'erreur de Kahan pour les longues séries (5000 images)
     output_compensation = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
     weight_compensation = torch.zeros((C, H_out, W_out), dtype=torch.float32, device=device)
 
     r = (pixfrac * scale) / 2.0
-    max_search = int(np.ceil(r)) + 1
-
-    y_in, x_in = torch.meshgrid(torch.arange(H_ref, dtype=torch.float32, device=device), torch.arange(W_ref, dtype=torch.float32, device=device), indexing='ij')
-    x_in_flat, y_in_flat = x_in.reshape(-1), y_in.reshape(-1)
+    max_search = 1 
 
     with torch.inference_mode():
         for i, path in enumerate(fits_paths):
             data = load_fits_fz_single(path)
-            
             img = data['img']
             dx, dy, angle_deg = data['dx'], data['dy'], data['angle_deg']
             angle_rad = np.radians(angle_deg)
             crpix1_curr, crpix2_curr = data['crpix1'], data['crpix2']
             
             if (i + 1) % 100 == 0 or (i + 1) == len(fits_paths):
-                print(f"[{i+1}/{len(fits_paths)}] Traitement -> {data['name']}")
+                print(f"[{i+1}/{len(fits_paths)}] Empilement et expansion en VRAM -> {data['name']}")
 
             img_tensor = torch.as_tensor(img, device=device, dtype=torch.float32)
+            _, H_in, W_in = img.shape
 
-            # --- CALCUL DES DIMENSIONS REPLACÉ CORRECTEMENT ICI ---
-            C_curr, H_in, W_in = img.shape
+            y_dyn, x_dyn = torch.meshgrid(torch.arange(H_in, dtype=torch.float32, device=device), torch.arange(W_in, dtype=torch.float32, device=device), indexing='ij')
+            xc_scaled = (x_dyn.reshape(-1) - crpix1_curr) * scale
+            yc_scaled = (y_dyn.reshape(-1) - crpix2_curr) * scale
 
-            if H_in != H_ref or W_in != W_ref:
-                y_dyn, x_dyn = torch.meshgrid(torch.arange(H_in, dtype=torch.float32, device=device), torch.arange(W_in, dtype=torch.float32, device=device), indexing='ij')
-                xf, yf = x_dyn.reshape(-1), y_dyn.reshape(-1)
-                xc_in = xf - crpix1_curr
-                yc_in = yf - crpix2_curr
-            else:
-                xc_in = x_in_flat - crpix1_curr
-                yc_in = y_in_flat - crpix2_curr
+            if angle_deg != 0.0:
+                cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
+                x_rot = xc_scaled * cos_a - yc_scaled * sin_a
+                y_rot = xc_scaled * sin_a + yc_scaled * cos_a
+                xc_scaled, yc_scaled = x_rot, y_rot
 
-            cos_a, sin_a = np.cos(angle_rad), np.sin(angle_rad)
-            xc_scaled = (xc_in * cos_a - yc_in * sin_a) * scale
-            yc_scaled = (xc_in * sin_a + yc_in * cos_a) * scale
+            target_x = xc_scaled + ((dx + x_offset_canvas) * scale) + crpix1_out
+            target_y = yc_scaled - ((dy - y_offset_canvas) * scale) + crpix2_out
 
-            target_x = xc_scaled + dx + crpix1_out
-            target_y = yc_scaled - dy + crpix2_out
+            # --- EXPANSION DE LA TOILE À LA VOLÉE ---
+            min_x_need = int(torch.floor(target_x.min()).item()) - max_search
+            max_x_need = int(torch.ceil(target_x.max()).item()) + max_search
+            min_y_need = int(torch.floor(target_y.min()).item()) - max_search
+            max_y_need = int(torch.ceil(target_y.max()).item()) + max_search
+
+            pad_left = max(0, -min_x_need)
+            pad_right = max(0, max_x_need - W_out + 1)
+            pad_top = max(0, -min_y_need)
+            pad_bottom = max(0, max_y_need - H_out + 1)
+
+            if pad_left > 0 or pad_right > 0 or pad_top > 0 or pad_bottom > 0:
+                x_offset_canvas += pad_left
+                y_offset_canvas += pad_top
+                crpix1_out += pad_left
+                crpix2_out += pad_top
+                
+                output_accum = F.pad(output_accum, (pad_left, pad_right, pad_top, pad_bottom))
+                weight_accum = F.pad(weight_accum, (pad_left, pad_right, pad_top, pad_bottom))
+                output_compensation = F.pad(output_compensation, (pad_left, pad_right, pad_top, pad_bottom))
+                weight_compensation = F.pad(weight_compensation, (pad_left, pad_right, pad_top, pad_bottom))
+                
+                H_out, W_out = output_accum.shape[1:]
+                target_x += pad_left
+                target_y += pad_top
+
             x1, x2 = target_x - r, target_x + r
             y1, y2 = target_y - r, target_y + r
 
@@ -136,7 +163,6 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
                 out_y = torch.round(target_y) + dy_pix
                 valid_y = (out_y >= 0) & (out_y < H_out)
                 if not valid_y.any(): continue
-                
                 y_overlap = torch.clamp(torch.minimum(out_y, y2) - torch.maximum(out_y - 1.0, y1), min=0.0)
                 
                 for dx_pix in range(-max_search, max_search + 1):
@@ -150,16 +176,13 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
                     active_indices = weights > 0
                     if not active_indices.any(): continue
 
-                    y_idx = out_y[active_indices].to(torch.int32)
-                    x_idx = out_x[active_indices].to(torch.int32)
-                    spatial_idx = y_idx * W_out + x_idx
+                    spatial_idx = out_y[active_indices].to(torch.int32) * W_out + out_x[active_indices].to(torch.int32)
                     w_act = weights[active_indices]
 
                     for channel in range(C):
                         flat_channel_input = img_tensor[channel].reshape(-1)
                         val_act = flat_channel_input[active_indices]
 
-                        # 1. Somme de Kahan sur la carte de poids spécifique au canal
                         weight_input = torch.zeros(H_out * W_out, dtype=torch.float32, device=device)
                         weight_input.scatter_add_(0, spatial_idx, w_act)
                         
@@ -168,7 +191,6 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
                         weight_compensation[channel] = (t_w - weight_accum[channel]) - y_w
                         weight_accum[channel] = t_w
 
-                        # 2. Somme de Kahan sur le signal du canal
                         val_input = torch.zeros(H_out * W_out, dtype=torch.float32, device=device)
                         val_input.scatter_add_(0, spatial_idx, val_act * w_act)
 
@@ -183,13 +205,15 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
     final_stack = torch.where(weight_accum > 0, output_accum / weight_accum, 0.0)
 
     if rgb_equal and C == 3:
-        print("⚖️ Égalisation RVB...")
-        masque_intersection_couleur = (weight_accum[0] > 0) & (weight_accum[1] > 0) & (weight_accum[2] > 0)
+        print("⚖️ Égalisation RVB finale...")
+        masque_intersection_couleur = (weight_accum > 0) & (weight_accum > 0) & (weight_accum > 0)
+        
+        # --- FIXATION DU BUG D'INDEX : Isolement du premier canal pour forcer un masque 2D ---
         seuil_poids_central = torch.max(weight_accum) * 0.8
         masque_centre_2d = weight_accum[0] > seuil_poids_central
-        
+
         if not masque_centre_2d.any():
-            masque_centre_2d = masque_intersection_couleur
+            masque_centre_2d = masque_intersection_couleur[0]
 
         means = []
         for c in range(3):
@@ -204,7 +228,7 @@ def gpu_bayer_drizzle_stack_sequential(fits_paths, scale=1.0, pixfrac=0.7, rgb_e
         final_stack[2] *= k_blue
 
         for c in range(3):
-            final_stack[c] = torch.where(masque_intersection_couleur, final_stack[c], torch.tensor(0.0, device=device))
+            final_stack[c] = torch.where(masque_intersection_couleur[c], final_stack[c], torch.tensor(0.0, device=device))
 
     return final_stack.cpu().numpy(), weight_accum.cpu().numpy()
 
@@ -224,11 +248,9 @@ if __name__ == "__main__":
         try:
             import time
             start_time = time.time()
-            
-            image_couleur, carte_poids = gpu_bayer_drizzle_stack_sequential(fichiers_trouves, scale=1.0, rgb_equal=True)
-            
-            fits.writeto("drizzle_final_perfect.fits", image_couleur, overwrite=True)
-            print(f"🎉 [MULTI-WEIGHT KAHAN STACK] Traitement achevé en {time.time() - start_time:.2f} secondes !")
+            image_couleur, carte_poids = gpu_linear_dynamic_boundary_stack(fichiers_trouves, scale=1.0, pixfrac=1.0, rgb_equal=True)
+            fits.writeto("drizzle_final_maximum_boundary.fits", image_couleur, overwrite=True)
+            print(f"🎉 [MAXIMUM BOUNDARY COMPLETE] Traitement achevé en {time.time() - start_time:.2f} secondes !")
         except Exception as e:
             print("\n💥 Une erreur globale est survenue durant l'exécution !")
             traceback.print_exc()
