@@ -71,7 +71,7 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--provider",
-        choices=("directml", "cpu"),
+        choices=("directml", "cpu", "webgpu"),
         default="directml",
         help="ONNX Runtime execution provider (default: %(default)s)",
     )
@@ -435,13 +435,39 @@ def _create_inference_session(ort, model_path, provider):
             str(model_path), providers=["CPUExecutionProvider"]
         )
 
+    if provider == "webgpu":
+        if "WebGpuExecutionProvider" not in ort.get_available_providers():
+            raise RuntimeError(
+                "ONNX Runtime still does not expose WebGpuExecutionProvider "
+                "after requesting `onnxruntime-webgpu`. Restart Siril to load "
+                "the replaced runtime; if the provider is still missing, verify "
+                "the package is supported on this platform."
+            )
+        try:
+            session = ort.InferenceSession(
+                str(model_path), providers=["WebGpuExecutionProvider"]
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "ONNX Runtime could not initialize WebGpuExecutionProvider. "
+                "Check that a compatible GPU and graphics driver are available. "
+                f"Runtime error: {error}"
+            ) from error
+        if "WebGpuExecutionProvider" not in session.get_providers():
+            raise RuntimeError(
+                "ONNX Runtime did not activate WebGpuExecutionProvider. Restart "
+                "Siril after the runtime switch and verify a compatible GPU "
+                "driver is available."
+            )
+        return session
+
     if sys.platform != "win32":
         raise RuntimeError("The DirectML execution provider is available only on Windows.")
     if "DmlExecutionProvider" not in ort.get_available_providers():
         raise RuntimeError(
-            "ONNX Runtime did not load DmlExecutionProvider. Install "
-            "`onnxruntime-directml` and remove the conflicting CPU-only "
-            "`onnxruntime` package from this Python environment."
+            "ONNX Runtime does not expose DmlExecutionProvider. If you switched "
+            "providers, select DirectML again and restart Siril to restore "
+            "`onnxruntime-directml`."
         )
 
     options = ort.SessionOptions()
@@ -458,6 +484,53 @@ def _create_inference_session(ort, model_path, provider):
             "fallback was selected."
         )
     return session
+
+
+def _ensure_runtime_dependencies(siril, provider):
+    import importlib.metadata as metadata
+
+    runtime_packages = {
+        "onnxruntime",
+        "onnxruntime-directml",
+        "onnxruntime-webgpu",
+    }
+    installed_packages = {
+        distribution.metadata.get("Name", "").lower().replace("_", "-")
+        for distribution in metadata.distributions()
+    }.intersection(runtime_packages)
+
+    if provider == "cpu":
+        packages = ("numpy",) if installed_packages else ("numpy", "onnxruntime")
+        siril.ensure_installed(*packages)
+        return
+
+    runtime_package = (
+        "onnxruntime-directml"
+        if provider == "directml"
+        else "onnxruntime-webgpu"
+    )
+    expected_provider = (
+        "DmlExecutionProvider"
+        if provider == "directml"
+        else "WebGpuExecutionProvider"
+    )
+    conflicts = installed_packages.difference((runtime_package,))
+    if conflicts and runtime_package in installed_packages:
+        try:
+            import onnxruntime as ort
+
+            active_providers = ort.get_available_providers()
+        except ImportError:
+            active_providers = ()
+        if expected_provider not in active_providers:
+            siril.ensure_installed("numpy")
+            siril.ensure_installed(runtime_package, reinstall=True)
+            raise RuntimeError(
+                f"Reinstalled {runtime_package} to replace the active ONNX "
+                "Runtime provider. Restart Siril, then run this script again."
+            )
+
+    siril.ensure_installed("numpy", runtime_package)
 
 
 def _default_model_path(user_data_dir, precision="fp16"):
@@ -581,13 +654,24 @@ def main(argv=None):
             raise RuntimeError("sirilpy >= 1.0.10 is required.")
         if args.provider == "directml" and sys.platform != "win32":
             raise RuntimeError("The DirectML execution provider is available only on Windows.")
-        runtime_package = (
-            "onnxruntime-directml" if args.provider == "directml" else "onnxruntime"
-        )
-        s.ensure_installed("numpy", runtime_package)
+        if args.provider == "webgpu" and sys.version_info < (3, 11):
+            raise RuntimeError(
+                "The onnxruntime-webgpu package requires Python 3.11 or newer; "
+                f"Siril is running Python {sys.version_info.major}."
+                f"{sys.version_info.minor}."
+            )
+        _ensure_runtime_dependencies(s, args.provider)
 
         import numpy as np
-        import onnxruntime as ort
+        try:
+            import onnxruntime as ort
+        except ImportError as error:
+            if args.provider == "webgpu":
+                raise RuntimeError(
+                    "WebGPU requires the `onnxruntime-webgpu` package in "
+                    "Siril's Python environment."
+                ) from error
+            raise
 
         _run(args, s, np, ort)
     except Exception as error:

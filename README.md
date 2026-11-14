@@ -80,3 +80,37 @@ original script's GUI, sequence processing, or preview workflow. CPU inference
 on large full-resolution images can take a long time. During processing, Siril's
 console and progress status report each tile's ONNX inference time and the
 cumulative model-inference and total processing times; no trace file is written.
+
+To select ONNX Runtime's native WebGPU provider, use `--provider webgpu`:
+
+```text
+pyscript SCUNet_ONNX_Denoise.py --provider webgpu
+```
+
+This installs Microsoft's `onnxruntime-webgpu` package when needed (Python
+3.11+; Siril's Python 3.12.9 is compatible). The package exposes
+`WebGpuExecutionProvider` through the usual `onnxruntime` Python API; it is not
+the JavaScript/browser runtime. Its published wheels cover Windows x86-64,
+Linux x86-64, and macOS 14+ on Apple Silicon. A compatible GPU/driver is
+required: Windows uses Direct3D 12 or Vulkan through Dawn, Linux uses Vulkan,
+and macOS uses Metal. The script checks that the provider is available and
+active and reports device initialization failures. ONNX Runtime may still assign
+unsupported model operations to its CPU provider.
+
+`onnxruntime-webgpu`, `onnxruntime-directml`, and `onnxruntime` are separate
+distributions that provide the same `onnxruntime` Python module; they cannot be
+safely mixed in one Python environment. When `--provider webgpu` is selected,
+the script requests `onnxruntime-webgpu` through Siril's
+`s.ensure_installed(...)`, replacing the active ONNX Runtime files with the
+WebGPU build. It does not uninstall the DirectML distribution, but DirectML is
+no longer available from the active runtime until restored. If the selected
+runtime distribution is already installed but another provider is active, the
+script reinstalls the selected runtime and asks you to restart Siril before
+running again. It verifies provider availability and activation and reports an
+actionable error if WebGPU still cannot be used.
+
+DirectML remains the default and requires `onnxruntime-directml` on Windows.
+Selecting `--provider directml` restores that runtime if it was replaced; a
+restart may be required. The `onnxruntime-webgpu` package also provides the CPU
+execution provider, so `--provider cpu` can use the active runtime without
+replacing it.
