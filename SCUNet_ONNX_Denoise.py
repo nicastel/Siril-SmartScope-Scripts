@@ -1,6 +1,7 @@
 import argparse
 import math
 import sys
+import time
 from pathlib import Path
 
 
@@ -241,6 +242,7 @@ def _run_tiled(
     total_tiles = len(starts_y) * len(starts_x)
     ghs_params = _compute_ghs_params(np, image.transpose(1, 2, 0)) if pre_stretch else None
     tile_number = 0
+    inference_seconds = 0.0
 
     for y_start in starts_y:
         for x_start in starts_x:
@@ -280,7 +282,17 @@ def _run_tiled(
             model_input = np.ascontiguousarray(
                 tile[np.newaxis].astype(input_dtype, copy=False)
             )
+            tile_started = time.perf_counter()
             prediction = session.run([output_name], {input_name: model_input})[0]
+            tile_elapsed = time.perf_counter() - tile_started
+            inference_seconds += tile_elapsed
+            if progress_callback is not None:
+                progress_callback(
+                    tile_number,
+                    total_tiles,
+                    tile_elapsed,
+                    inference_seconds,
+                )
             if prediction.ndim != 4 or prediction.shape[0] != 1:
                 raise ValueError(f"Unexpected ONNX output shape: {prediction.shape}")
             if prediction.shape[2:] != model_input.shape[2:]:
@@ -314,10 +326,12 @@ def _run_tiled(
             weight = _tile_weight(np, core_height, core_width)
             output_sum[:, y_start:y_end, x_start:x_end] += core * weight[np.newaxis]
             output_weight[y_start:y_end, x_start:x_end] += weight
-            if progress_callback is not None:
-                progress_callback(tile_number, total_tiles)
 
-    return output_sum / np.maximum(output_weight[np.newaxis], 1e-8)
+    denoised = output_sum / np.maximum(output_weight[np.newaxis], 1e-8)
+    return denoised, {
+        "tiles": total_tiles,
+        "inference_seconds": inference_seconds,
+    }
 
 
 def _process_image(
@@ -391,7 +405,7 @@ def _process_image(
     if input_meta.type not in ("tensor(float)", "tensor(float16)"):
         raise ValueError(f"Unsupported ONNX input type: {input_meta.type}")
 
-    denoised = _run_tiled(
+    denoised, timing = _run_tiled(
         np,
         session,
         input_meta.name,
@@ -412,7 +426,7 @@ def _process_image(
     result = denoised * args.strength + original * (1.0 - args.strength)
     if original_dtype == np.uint8 or original_dtype == np.uint16:
         result = np.clip(result, 0.0, 1.0) * divisor
-    return result.astype(original_dtype)
+    return result.astype(original_dtype), timing
 
 
 def _create_inference_session(ort, model_path, provider):
@@ -453,6 +467,10 @@ def _default_model_path(user_data_dir, precision="fp16"):
     return Path(user_data_dir) / "scunet_models" / model_filename
 
 
+def _format_duration(seconds):
+    return f"{seconds:.2f}s"
+
+
 def _run(args, sirilpy, np, ort):
     siril = sirilpy.SirilInterface()
     try:
@@ -489,11 +507,23 @@ def _run(args, sirilpy, np, ort):
         )
         image = siril.get_image()
         original_max = int(image.data.max()) if image.data.dtype == np.uint16 else None
+        image_started = time.perf_counter()
 
-        def progress_callback(done, total):
-            siril.update_progress("SCUNet ONNX", done / total)
+        def progress_callback(done, total, tile_elapsed, inference_elapsed):
+            siril.update_progress(
+                f"SCUNet ONNX tile {done}/{total} "
+                f"({_format_duration(tile_elapsed)}; "
+                f"cumulative inference {_format_duration(inference_elapsed)})",
+                done / total,
+            )
+            siril.log(
+                f"SCUNet ONNX tile {done}/{total}: "
+                f"inference {_format_duration(tile_elapsed)} "
+                f"(cumulative {_format_duration(inference_elapsed)})",
+                sirilpy.LogColor.BLUE,
+            )
 
-        processed = _process_image(
+        processed, timing = _process_image(
             np,
             session,
             image.data,
@@ -501,6 +531,13 @@ def _run(args, sirilpy, np, ort):
             input_meta,
             output_meta,
             progress_callback,
+        )
+        processing_elapsed = time.perf_counter() - image_started
+        siril.log(
+            f"SCUNet ONNX timing: {timing['tiles']} tiles; "
+            f"ONNX inference {_format_duration(timing['inference_seconds'])}; "
+            f"total processing {_format_duration(processing_elapsed)}",
+            sirilpy.LogColor.BLUE,
         )
         siril.undo_save_state(
             f"SCUNet ONNX - {model_path.stem} | Strength: {args.strength:.2f}"

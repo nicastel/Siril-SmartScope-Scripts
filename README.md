@@ -77,4 +77,6 @@ silently switch to CPU if DirectML is unavailable. Use `--provider cpu` for
 either fixed- or dynamic-shape models instead. A mono model cannot process an
 RGB image. This script processes one loaded image only; it does not provide the
 original script's GUI, sequence processing, or preview workflow. CPU inference
-on large full-resolution images can take a long time.
+on large full-resolution images can take a long time. During processing, Siril's
+console and progress status report each tile's ONNX inference time and the
+cumulative model-inference and total processing times; no trace file is written.
