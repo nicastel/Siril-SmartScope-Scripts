@@ -1,5 +1,6 @@
 import argparse
 import sys
+import tempfile
 from pathlib import Path
 
 
@@ -39,6 +40,12 @@ def _parse_args(argv=None):
         "--dynamic-shapes",
         action="store_true",
         help="export dynamic batch/height/width axes instead of the DirectML-friendly fixed dimensions",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=("fp16", "fp32", "both"),
+        default="fp16",
+        help="ONNX model variant(s) to write (default: %(default)s)",
     )
     args = parser.parse_args(argv)
     for label, dimension in (("height", args.height), ("width", args.width)):
@@ -124,6 +131,17 @@ def _export(args):
     base_name = model_path.stem
     fp32_path = output_dir / f"{base_name}_fp32.onnx"
     fp16_path = output_dir / f"{base_name}_fp16.onnx"
+    if args.precision == "fp16":
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix=f"{base_name}_export_",
+            suffix=".onnx",
+            dir=output_dir,
+            delete=False,
+        )
+        export_path = Path(temp_file.name)
+        temp_file.close()
+    else:
+        export_path = fp32_path
 
     export_options = {
         "export_params": True,
@@ -139,18 +157,29 @@ def _export(args):
             "output": {0: "batch_size", 2: "height", 3: "width"},
         }
 
-    with torch.no_grad():
-        torch.onnx.export(model, dummy_input, str(fp32_path), **export_options)
+    should_export_fp32 = args.precision in ("fp32", "both")
+    should_export_fp16 = args.precision in ("fp16", "both")
+    try:
+        with torch.no_grad():
+            torch.onnx.export(model, dummy_input, str(export_path), **export_options)
 
-    model_fp32 = onnx.load(str(fp32_path))
-    onnx.checker.check_model(model_fp32)
-    model_fp16 = float16.convert_float_to_float16(model_fp32, keep_io_types=True)
-    onnx.checker.check_model(model_fp16)
-    onnx.save(model_fp16, str(fp16_path))
+        model_fp32 = onnx.load(str(export_path))
+        onnx.checker.check_model(model_fp32)
+        if should_export_fp16:
+            model_fp16 = float16.convert_float_to_float16(
+                model_fp32, keep_io_types=True
+            )
+            onnx.checker.check_model(model_fp16)
+            onnx.save(model_fp16, str(fp16_path))
+    finally:
+        if export_path != fp32_path and export_path.exists():
+            export_path.unlink()
 
     print(f"Exported {descriptor.architecture.name} from {model_path}")
-    print(f"FP32: {fp32_path}")
-    print(f"FP16: {fp16_path}")
+    if should_export_fp32:
+        print(f"FP32: {fp32_path}")
+    if should_export_fp16:
+        print(f"FP16: {fp16_path}")
 
 
 def main(argv=None):

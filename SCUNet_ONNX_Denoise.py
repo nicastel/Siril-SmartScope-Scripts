@@ -4,7 +4,8 @@ import sys
 from pathlib import Path
 
 
-DEFAULT_MODEL_FILENAME = "scunet_color_real_psnr_fp32.onnx"
+DEFAULT_MODEL_FILENAME = "scunet_color_real_psnr_fp16.onnx"
+FP32_MODEL_FILENAME = "scunet_color_real_psnr_fp32.onnx"
 TILE_PAD = 144
 SCUNET_SIZE_MULTIPLE = 64
 DEFAULT_TILE_SIZE = 128
@@ -42,7 +43,13 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--model",
         type=Path,
-        help="path to an exported SCUNet ONNX model (defaults to the standard FP32 model)",
+        help="path to an exported SCUNet ONNX model (defaults to the standard FP16 model)",
+    )
+    parser.add_argument(
+        "--precision",
+        choices=("fp16", "fp32"),
+        default="fp16",
+        help="default exported model precision when --model is omitted (default: %(default)s)",
     )
     parser.add_argument(
         "--strength",
@@ -439,6 +446,13 @@ def _create_inference_session(ort, model_path, provider):
     return session
 
 
+def _default_model_path(user_data_dir, precision="fp16"):
+    model_filename = (
+        DEFAULT_MODEL_FILENAME if precision == "fp16" else FP32_MODEL_FILENAME
+    )
+    return Path(user_data_dir) / "scunet_models" / model_filename
+
+
 def _run(args, sirilpy, np, ort):
     siril = sirilpy.SirilInterface()
     try:
@@ -454,10 +468,8 @@ def _run(args, sirilpy, np, ort):
 
         model_path = args.model
         if model_path is None:
-            model_path = (
-                Path(siril.get_siril_userdatadir())
-                / "scunet_models"
-                / DEFAULT_MODEL_FILENAME
+            model_path = _default_model_path(
+                siril.get_siril_userdatadir(), args.precision
             )
         model_path = model_path.expanduser().resolve()
         if not model_path.is_file():
