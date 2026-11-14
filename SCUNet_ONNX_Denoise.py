@@ -7,6 +7,7 @@ from pathlib import Path
 DEFAULT_MODEL_FILENAME = "scunet_color_real_psnr_fp32.onnx"
 TILE_PAD = 144
 SCUNET_SIZE_MULTIPLE = 64
+DEFAULT_TILE_SIZE = 128
 GHS_BG_TARGET = 0.25
 GHS_SHADOW_K = 0.0
 GHS_D_SCALE = 1.5
@@ -17,9 +18,9 @@ def _tile_size(value):
         size = int(value)
     except ValueError as error:
         raise argparse.ArgumentTypeError("tile size must be an integer") from error
-    if size not in (128, 256, 384, 512):
+    if size not in (64, 128, 256, 384, 512):
         raise argparse.ArgumentTypeError(
-            "tile size must be one of 128, 256, 384, or 512"
+            "tile size must be one of 64, 128, 256, 384, or 512"
         )
     return size
 
@@ -52,13 +53,19 @@ def _parse_args(argv=None):
     parser.add_argument(
         "--tile-size",
         type=_tile_size,
-        default=256,
+        default=DEFAULT_TILE_SIZE,
         help="tile core size in pixels (default: %(default)s)",
     )
     parser.add_argument(
         "--pre-stretch",
         action="store_true",
         help="apply the original script's GHS prestretch/destretch for linear images",
+    )
+    parser.add_argument(
+        "--provider",
+        choices=("directml", "cpu"),
+        default="directml",
+        help="ONNX Runtime execution provider (default: %(default)s)",
     )
     return parser.parse_args(argv)
 
@@ -200,8 +207,26 @@ def _run_tiled(
     tile_size,
     pre_stretch,
     progress_callback=None,
+    model_height=None,
+    model_width=None,
 ):
     channels, height, width = image.shape
+    if model_height is None or model_width is None:
+        pad_y = TILE_PAD
+        pad_x = TILE_PAD
+        fixed_height = None
+        fixed_width = None
+    else:
+        if tile_size > model_height or tile_size > model_width:
+            raise ValueError(
+                f"Tile size {tile_size} exceeds the fixed ONNX input size "
+                f"{model_height}x{model_width}."
+            )
+        pad_y = (model_height - tile_size) // 2
+        pad_x = (model_width - tile_size) // 2
+        fixed_height = model_height
+        fixed_width = model_width
+
     output_sum = np.zeros((channels, height, width), dtype=np.float32)
     output_weight = np.zeros((height, width), dtype=np.float32)
     starts_y = _tile_starts(height, tile_size)
@@ -215,13 +240,19 @@ def _run_tiled(
             tile_number += 1
             y_end = min(y_start + tile_size, height)
             x_end = min(x_start + tile_size, width)
-            input_y_start = max(y_start - TILE_PAD, 0)
-            input_x_start = max(x_start - TILE_PAD, 0)
-            input_y_end = min(y_end + TILE_PAD, height)
-            input_x_end = min(x_end + TILE_PAD, width)
+            input_y_start = max(y_start - pad_y, 0)
+            input_x_start = max(x_start - pad_x, 0)
+            input_y_end = min(y_end + pad_y, height)
+            input_x_end = min(x_end + pad_x, width)
             tile = image[:, input_y_start:input_y_end, input_x_start:input_x_end]
-            pad_height = (-tile.shape[1]) % SCUNET_SIZE_MULTIPLE
-            pad_width = (-tile.shape[2]) % SCUNET_SIZE_MULTIPLE
+            if fixed_height is None:
+                pad_height = (-tile.shape[1]) % SCUNET_SIZE_MULTIPLE
+                pad_width = (-tile.shape[2]) % SCUNET_SIZE_MULTIPLE
+            else:
+                pad_height = fixed_height - tile.shape[1]
+                pad_width = fixed_width - tile.shape[2]
+                if pad_height < 0 or pad_width < 0:
+                    raise ValueError("Tile context exceeds the fixed ONNX input size.")
             if pre_stretch:
                 tile_hwc = _apply_stretch(np, tile.transpose(1, 2, 0), ghs_params)
                 tile = tile_hwc.transpose(2, 0, 1).astype(np.float32)
@@ -328,17 +359,24 @@ def _process_image(
             "This monochrome ONNX model cannot process an RGB Siril image."
         )
 
-    if any(isinstance(dim, int) for dim in model_shape[2:]):
+    static_height, static_width = model_shape[2:]
+    has_static_dimensions = isinstance(static_height, int) and isinstance(
+        static_width, int
+    )
+    if isinstance(static_height, int) != isinstance(static_width, int):
+        raise ValueError("ONNX input height and width must both be fixed or dynamic.")
+    if args.provider == "directml" and not has_static_dimensions:
         raise ValueError(
-            "Expected an ONNX model exported with dynamic height and width axes."
+            "DirectML requires an ONNX model exported with fixed height and width. "
+            "Re-export without --dynamic-shapes."
         )
     output_shape = output_meta.shape
     if len(output_shape) != 4:
         raise ValueError(f"Expected a rank-four ONNX output, got {output_shape}.")
     if isinstance(output_shape[1], int) and output_shape[1] != model_channels:
         raise ValueError("ONNX input and output channel counts must match.")
-    if any(isinstance(dim, int) for dim in output_shape[2:]):
-        raise ValueError("Expected dynamic height and width axes on the ONNX output.")
+    if has_static_dimensions and output_shape[2:] != model_shape[2:]:
+        raise ValueError("Static ONNX input and output spatial dimensions must match.")
 
     input_dtype = np.float16 if input_meta.type == "tensor(float16)" else np.float32
     if input_meta.type not in ("tensor(float)", "tensor(float16)"):
@@ -354,6 +392,8 @@ def _process_image(
         args.tile_size,
         args.pre_stretch,
         progress_callback,
+        static_height if has_static_dimensions else None,
+        static_width if has_static_dimensions else None,
     )
     if is_mono:
         denoised = denoised[0]
@@ -364,6 +404,37 @@ def _process_image(
     if original_dtype == np.uint8 or original_dtype == np.uint16:
         result = np.clip(result, 0.0, 1.0) * divisor
     return result.astype(original_dtype)
+
+
+def _create_inference_session(ort, model_path, provider):
+    if provider == "cpu":
+        return ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
+        )
+
+    if sys.platform != "win32":
+        raise RuntimeError("The DirectML execution provider is available only on Windows.")
+    if "DmlExecutionProvider" not in ort.get_available_providers():
+        raise RuntimeError(
+            "ONNX Runtime did not load DmlExecutionProvider. Install "
+            "`onnxruntime-directml` and remove the conflicting CPU-only "
+            "`onnxruntime` package from this Python environment."
+        )
+
+    options = ort.SessionOptions()
+    options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+    options.enable_mem_pattern = False
+    session = ort.InferenceSession(
+        str(model_path),
+        sess_options=options,
+        providers=["DmlExecutionProvider"],
+    )
+    if "DmlExecutionProvider" not in session.get_providers():
+        raise RuntimeError(
+            "ONNX Runtime failed to activate DmlExecutionProvider; no CPU "
+            "fallback was selected."
+        )
+    return session
 
 
 def _run(args, sirilpy, np, ort):
@@ -390,9 +461,7 @@ def _run(args, sirilpy, np, ort):
         if not model_path.is_file():
             raise FileNotFoundError(f"ONNX model not found: {model_path}")
 
-        session = ort.InferenceSession(
-            str(model_path), providers=["CPUExecutionProvider"]
-        )
+        session = _create_inference_session(ort, model_path, args.provider)
         inputs = session.get_inputs()
         outputs = session.get_outputs()
         if len(inputs) != 1 or len(outputs) != 1:
@@ -453,7 +522,12 @@ def main(argv=None):
 
         if not s.check_module_version(">=1.0.10"):
             raise RuntimeError("sirilpy >= 1.0.10 is required.")
-        s.ensure_installed("numpy", "onnxruntime")
+        if args.provider == "directml" and sys.platform != "win32":
+            raise RuntimeError("The DirectML execution provider is available only on Windows.")
+        runtime_package = (
+            "onnxruntime-directml" if args.provider == "directml" else "onnxruntime"
+        )
+        s.ensure_installed("numpy", runtime_package)
 
         import numpy as np
         import onnxruntime as ort

@@ -35,6 +35,11 @@ def _parse_args(argv=None):
         default=DEFAULT_SIZE,
         help=f"export input width; must be a positive multiple of {SCUNET_SIZE_MULTIPLE} (default: %(default)s)",
     )
+    parser.add_argument(
+        "--dynamic-shapes",
+        action="store_true",
+        help="export dynamic batch/height/width axes instead of the DirectML-friendly fixed dimensions",
+    )
     args = parser.parse_args(argv)
     for label, dimension in (("height", args.height), ("width", args.width)):
         if dimension <= 0 or dimension % SCUNET_SIZE_MULTIPLE:
@@ -120,22 +125,22 @@ def _export(args):
     fp32_path = output_dir / f"{base_name}_fp32.onnx"
     fp16_path = output_dir / f"{base_name}_fp16.onnx"
 
+    export_options = {
+        "export_params": True,
+        "opset_version": 17,
+        "do_constant_folding": True,
+        "input_names": ["input"],
+        "output_names": ["output"],
+        "dynamo": False,
+    }
+    if args.dynamic_shapes:
+        export_options["dynamic_axes"] = {
+            "input": {0: "batch_size", 2: "height", 3: "width"},
+            "output": {0: "batch_size", 2: "height", 3: "width"},
+        }
+
     with torch.no_grad():
-        torch.onnx.export(
-            model,
-            dummy_input,
-            str(fp32_path),
-            export_params=True,
-            opset_version=17,
-            do_constant_folding=True,
-            input_names=["input"],
-            output_names=["output"],
-            dynamic_axes={
-                "input": {0: "batch_size", 2: "height", 3: "width"},
-                "output": {0: "batch_size", 2: "height", 3: "width"},
-            },
-            dynamo=False,
-        )
+        torch.onnx.export(model, dummy_input, str(fp32_path), **export_options)
 
     model_fp32 = onnx.load(str(fp32_path))
     onnx.checker.check_model(model_fp32)
