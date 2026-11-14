@@ -367,8 +367,10 @@ def _process_image(
         raise ValueError("ONNX input height and width must both be fixed or dynamic.")
     if args.provider == "directml" and not has_static_dimensions:
         raise ValueError(
-            "DirectML requires an ONNX model exported with fixed height and width. "
-            "Re-export without --dynamic-shapes."
+            "DirectML requires fixed ONNX input dimensions; the selected model "
+            f"has dynamic dimensions {model_shape[2:]}. Run "
+            "`exportScunetToONNX.py` again without --dynamic-shapes to export "
+            "fixed-shape models."
         )
     output_shape = output_meta.shape
     if len(output_shape) != 4:
@@ -504,6 +506,12 @@ def _run(args, sirilpy, np, ort):
             f"SCUNet ONNX denoise complete: {model_path.name}",
             sirilpy.LogColor.GREEN,
         )
+    except Exception as error:
+        siril.log(
+            f"SCUNet ONNX inference failed: {error}",
+            sirilpy.LogColor.RED,
+        )
+        raise
     finally:
         try:
             siril.reset_progress()

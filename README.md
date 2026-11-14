@@ -64,7 +64,8 @@ The exporter produces single-input, single-output NCHW models with FP32 input
 and output (including the FP16-weight variant). DirectML requires the
 `onnxruntime-directml` package on Windows, fixed spatial model dimensions, and
 sequential execution. The exporter creates fixed-shape models by default;
-re-export previous dynamic models before using DirectML. Tile size must not
+re-export existing dynamic models before using DirectML by running
+`exportScunetToONNX.py` again without `--dynamic-shapes`. Tile size must not
 exceed the exported model's smaller spatial dimension. The script refuses to
 silently switch to CPU if DirectML is unavailable. Use `--provider cpu` for
 either fixed- or dynamic-shape models instead. A mono model cannot process an
