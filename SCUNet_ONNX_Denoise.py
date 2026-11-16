@@ -7,12 +7,19 @@ from pathlib import Path
 
 DEFAULT_MODEL_FILENAME = "scunet_color_real_psnr_fp16.onnx"
 FP32_MODEL_FILENAME = "scunet_color_real_psnr_fp32.onnx"
-TILE_PAD = 144
+TILE_PAD = 128
 SCUNET_SIZE_MULTIPLE = 64
 DEFAULT_TILE_SIZE = 128
 GHS_BG_TARGET = 0.25
 GHS_SHADOW_K = 0.0
 GHS_D_SCALE = 1.5
+_OPENVINO_REGISTRATION_NAME = "scunet_openvino"
+_OPENVINO_REGISTERED_LIBRARY = None
+_OPENVINO_SELECTED_DEVICE = None
+
+
+class InferenceCancelled(Exception):
+    pass
 
 
 def _tile_size(value):
@@ -71,7 +78,7 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--provider",
-        choices=("directml", "cpu", "webgpu"),
+        choices=("directml", "cpu", "webgpu", "openvino"),
         default="directml",
         help="ONNX Runtime execution provider (default: %(default)s)",
     )
@@ -205,6 +212,49 @@ def _tile_weight(np, height, width):
     return wy[:, np.newaxis] * wx[np.newaxis, :]
 
 
+def _decode_ort_native_error(error):
+    raw_message = error.object
+    if not isinstance(raw_message, bytes):
+        return str(error)
+    try:
+        return raw_message.decode("mbcs", errors="replace").strip()
+    except LookupError:
+        return raw_message.decode("cp1252", errors="replace").strip()
+
+
+def _run_onnx_inference(
+    session,
+    output_name,
+    input_name,
+    model_input,
+    tile_number,
+    total_tiles,
+    y_start,
+    x_start,
+):
+    try:
+        return session.run([output_name], {input_name: model_input})[0]
+    except UnicodeDecodeError as error:
+        if "DmlExecutionProvider" not in session.get_providers():
+            raise
+        native_message = _decode_ort_native_error(error)
+        recovery_hint = ""
+        if "887A0006" in native_message.upper():
+            recovery_hint = (
+                " Direct3D reported DXGI_ERROR_DEVICE_HUNG; restart Siril, "
+                "close other GPU-intensive applications, and if it recurs "
+                "try a smaller tile core or check the Intel graphics driver."
+            )
+        raise RuntimeError(
+            "ONNX Runtime DirectML returned a native error that Python could "
+            "not decode as UTF-8 while executing tile "
+            f"{tile_number}/{total_tiles} at y={y_start}, x={x_start} with "
+            f"input shape {model_input.shape}. Native message decoded using "
+            f"the Windows ANSI code page: {native_message}. CPU provider "
+            f"fallback is disabled.{recovery_hint}"
+        ) from error
+
+
 def _run_tiled(
     np,
     session,
@@ -217,6 +267,7 @@ def _run_tiled(
     progress_callback=None,
     model_height=None,
     model_width=None,
+    precomputed_ghs_params=None,
 ):
     channels, height, width = image.shape
     if model_height is None or model_width is None:
@@ -240,7 +291,11 @@ def _run_tiled(
     starts_y = _tile_starts(height, tile_size)
     starts_x = _tile_starts(width, tile_size)
     total_tiles = len(starts_y) * len(starts_x)
-    ghs_params = _compute_ghs_params(np, image.transpose(1, 2, 0)) if pre_stretch else None
+    ghs_params = None
+    if pre_stretch:
+        ghs_params = precomputed_ghs_params or _compute_ghs_params(
+            np, image.transpose(1, 2, 0)
+        )
     tile_number = 0
     inference_seconds = 0.0
 
@@ -283,16 +338,29 @@ def _run_tiled(
                 tile[np.newaxis].astype(input_dtype, copy=False)
             )
             tile_started = time.perf_counter()
-            prediction = session.run([output_name], {input_name: model_input})[0]
+            prediction = _run_onnx_inference(
+                session,
+                output_name,
+                input_name,
+                model_input,
+                tile_number,
+                total_tiles,
+                y_start,
+                x_start,
+            )
             tile_elapsed = time.perf_counter() - tile_started
             inference_seconds += tile_elapsed
             if progress_callback is not None:
-                progress_callback(
-                    tile_number,
-                    total_tiles,
-                    tile_elapsed,
-                    inference_seconds,
-                )
+                if (
+                    progress_callback(
+                        tile_number,
+                        total_tiles,
+                        tile_elapsed,
+                        inference_seconds,
+                    )
+                    is False
+                ):
+                    raise InferenceCancelled("SCUNet ONNX inference cancelled.")
             if prediction.ndim != 4 or prediction.shape[0] != 1:
                 raise ValueError(f"Unexpected ONNX output shape: {prediction.shape}")
             if prediction.shape[2:] != model_input.shape[2:]:
@@ -327,7 +395,7 @@ def _run_tiled(
             output_sum[:, y_start:y_end, x_start:x_end] += core * weight[np.newaxis]
             output_weight[y_start:y_end, x_start:x_end] += weight
 
-    denoised = output_sum / np.maximum(output_weight[np.newaxis], 1e-8)
+    denoised = output_sum / (output_weight[np.newaxis] + 1e-8)
     return denoised, {
         "tiles": total_tiles,
         "inference_seconds": inference_seconds,
@@ -335,7 +403,14 @@ def _run_tiled(
 
 
 def _process_image(
-    np, session, image_data, args, input_meta, output_meta, progress_callback=None
+    np,
+    session,
+    image_data,
+    args,
+    input_meta,
+    output_meta,
+    progress_callback=None,
+    precomputed_ghs_params=None,
 ):
     original_dtype = image_data.dtype
     if original_dtype == np.uint8:
@@ -417,6 +492,7 @@ def _process_image(
         progress_callback,
         static_height if has_static_dimensions else None,
         static_width if has_static_dimensions else None,
+        precomputed_ghs_params,
     )
     if is_mono:
         denoised = denoised[0]
@@ -429,11 +505,126 @@ def _process_image(
     return result.astype(original_dtype), timing
 
 
+def _get_openvino_gpu_device(ort):
+    if not hasattr(ort, "register_execution_provider_library"):
+        raise RuntimeError(
+            "OpenVINO GPU requires ONNX Runtime 1.23 or newer with "
+            "execution-provider plugin support."
+        )
+    try:
+        import onnxruntime_ep_openvino as openvino_ep
+    except ImportError as error:
+        raise RuntimeError(
+            "OpenVINO GPU requires the `onnxruntime-ep-openvino` plugin."
+        ) from error
+
+    global _OPENVINO_REGISTERED_LIBRARY
+    library_path = openvino_ep.get_library_path()
+    if _OPENVINO_REGISTERED_LIBRARY != library_path:
+        try:
+            ort.register_execution_provider_library(
+                _OPENVINO_REGISTRATION_NAME, library_path
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "Could not register the ONNX Runtime OpenVINO plugin. "
+                f"Plugin library: {library_path}. Runtime error: {error}"
+            ) from error
+        _OPENVINO_REGISTERED_LIBRARY = library_path
+
+    ep_name = openvino_ep.get_ep_name()
+    return next(
+        (
+            device
+            for device in ort.get_ep_devices()
+            if device.ep_name == ep_name
+            and device.ep_metadata.get("ov_device") == "GPU"
+        ),
+        None,
+    )
+
+
+def _select_windows_provider(requested_provider, openvino_gpu_available):
+    if requested_provider == "auto":
+        return "openvino" if openvino_gpu_available else "directml"
+    return requested_provider
+
+
+def _create_windows_inference_session(
+    ort, model_path, requested_provider, openvino_gpu_available
+):
+    provider = _select_windows_provider(
+        requested_provider, openvino_gpu_available
+    )
+    try:
+        session = _create_inference_session(ort, model_path, provider)
+    except Exception as error:
+        if requested_provider != "auto" or provider != "openvino":
+            raise
+        session = _create_inference_session(ort, model_path, "directml")
+        return session, "directml", error
+    return session, provider, None
+
+
 def _create_inference_session(ort, model_path, provider):
     if provider == "cpu":
         return ort.InferenceSession(
             str(model_path), providers=["CPUExecutionProvider"]
         )
+
+    if provider == "openvino":
+        gpu_device = _get_openvino_gpu_device(ort)
+        try:
+            import onnxruntime_ep_openvino as openvino_ep
+        except ImportError as error:
+            raise RuntimeError(
+                "OpenVINO GPU requires the `onnxruntime-ep-openvino` plugin. "
+                "Install it through Siril's Python environment and restart "
+                "Siril if needed."
+            ) from error
+        ep_name = openvino_ep.get_ep_name()
+        devices = [
+            device
+            for device in ort.get_ep_devices()
+            if device.ep_name == ep_name
+        ]
+        if gpu_device is None:
+            detected = ", ".join(
+                device.ep_metadata.get("FULL_DEVICE_NAME", "unnamed")
+                for device in devices
+            ) or "none"
+            raise RuntimeError(
+                "OpenVINO did not expose an Intel GPU device; refusing to "
+                f"fall back to CPU. Detected OpenVINO devices: {detected}."
+            )
+
+        global _OPENVINO_SELECTED_DEVICE
+        _OPENVINO_SELECTED_DEVICE = gpu_device.ep_metadata.get(
+            "FULL_DEVICE_NAME", "Intel GPU"
+        )
+        options = ort.SessionOptions()
+        options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        options.enable_mem_pattern = False
+        options.add_session_config_entry(
+            "session.disable_cpu_ep_fallback", "1"
+        )
+        options.add_provider_for_devices([gpu_device], {})
+        try:
+            session = ort.InferenceSession(
+                str(model_path), sess_options=options
+            )
+        except Exception as error:
+            raise RuntimeError(
+                "OpenVINO could not initialize the SCUNet model on the Intel "
+                "GPU without CPU execution-provider fallback. "
+                f"Runtime error: {error}"
+            ) from error
+        if ep_name not in session.get_providers():
+            raise RuntimeError(
+                "ONNX Runtime did not activate OpenVINOExecutionProvider on "
+                "the selected Intel GPU; CPU fallback is disabled."
+            )
+        return session
 
     if provider == "webgpu":
         if "WebGpuExecutionProvider" not in ort.get_available_providers():
@@ -473,11 +664,20 @@ def _create_inference_session(ort, model_path, provider):
     options = ort.SessionOptions()
     options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
     options.enable_mem_pattern = False
-    session = ort.InferenceSession(
-        str(model_path),
-        sess_options=options,
-        providers=["DmlExecutionProvider"],
-    )
+    options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
+    try:
+        session = ort.InferenceSession(
+            str(model_path),
+            sess_options=options,
+            providers=["DmlExecutionProvider"],
+        )
+    except Exception as error:
+        raise RuntimeError(
+            "DirectML could not initialize the selected SCUNet model without "
+            "CPU execution-provider fallback. Check that the ONNX Runtime "
+            "DirectML package, model, and GPU driver are compatible. "
+            f"Runtime error: {error}"
+        ) from error
     if "DmlExecutionProvider" not in session.get_providers():
         raise RuntimeError(
             "ONNX Runtime failed to activate DmlExecutionProvider; no CPU "
@@ -486,8 +686,12 @@ def _create_inference_session(ort, model_path, provider):
     return session
 
 
-def _ensure_runtime_dependencies(siril, provider):
+def _ensure_runtime_dependencies(sirilpy, provider):
     import importlib.metadata as metadata
+
+    if provider == "openvino":
+        sirilpy.ensure_installed("numpy", "onnxruntime-ep-openvino")
+        return
 
     runtime_packages = {
         "onnxruntime",
@@ -501,7 +705,7 @@ def _ensure_runtime_dependencies(siril, provider):
 
     if provider == "cpu":
         packages = ("numpy",) if installed_packages else ("numpy", "onnxruntime")
-        siril.ensure_installed(*packages)
+        sirilpy.ensure_installed(*packages)
         return
 
     runtime_package = (
@@ -523,14 +727,14 @@ def _ensure_runtime_dependencies(siril, provider):
         except ImportError:
             active_providers = ()
         if expected_provider not in active_providers:
-            siril.ensure_installed("numpy")
-            siril.ensure_installed(runtime_package, reinstall=True)
+            sirilpy.ensure_installed("numpy")
+            sirilpy.ensure_installed(runtime_package, reinstall=True)
             raise RuntimeError(
                 f"Reinstalled {runtime_package} to replace the active ONNX "
                 "Runtime provider. Restart Siril, then run this script again."
             )
 
-    siril.ensure_installed("numpy", runtime_package)
+    sirilpy.ensure_installed("numpy", runtime_package)
 
 
 def _default_model_path(user_data_dir, precision="fp16"):
@@ -574,8 +778,25 @@ def _run(args, sirilpy, np, ort):
         input_meta, output_meta = inputs[0], outputs[0]
 
         siril.log(f"SCUNet ONNX: {model_path}", sirilpy.LogColor.BLUE)
+        if args.provider == "directml":
+            siril.log(
+                "SCUNet inference backend: ONNX Runtime DirectML "
+                "(CPU execution-provider fallback disabled).",
+                sirilpy.LogColor.GREEN,
+            )
+        elif args.provider == "openvino":
+            siril.log(
+                "SCUNet inference backend: ONNX Runtime OpenVINO GPU "
+                f"({_OPENVINO_SELECTED_DEVICE}; CPU fallback disabled).",
+                sirilpy.LogColor.GREEN,
+            )
+        else:
+            siril.log(
+                f"SCUNet inference backend: ONNX Runtime {args.provider}.",
+                sirilpy.LogColor.GREEN,
+            )
         siril.log(
-            f"ONNX Runtime providers: {', '.join(session.get_providers())}",
+            f"ONNX Runtime registered providers: {', '.join(session.get_providers())}",
             sirilpy.LogColor.BLUE,
         )
         image = siril.get_image()
@@ -659,6 +880,11 @@ def main(argv=None):
                 "The onnxruntime-webgpu package requires Python 3.11 or newer; "
                 f"Siril is running Python {sys.version_info.major}."
                 f"{sys.version_info.minor}."
+            )
+        if args.provider == "openvino" and sys.version_info < (3, 10):
+            raise RuntimeError(
+                "The OpenVINO execution-provider plugin requires Python 3.10 "
+                "or newer."
             )
         _ensure_runtime_dependencies(s, args.provider)
 

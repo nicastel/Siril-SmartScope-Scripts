@@ -5,8 +5,7 @@ from pathlib import Path
 
 
 DEFAULT_MODEL_FILENAME = "scunet_color_real_psnr.pth"
-DEFAULT_SIZE = 256
-SCUNET_SIZE_MULTIPLE = 64
+DEFAULT_SIZE = 384
 
 
 def _parse_args(argv=None):
@@ -28,13 +27,18 @@ def _parse_args(argv=None):
         "--height",
         type=int,
         default=DEFAULT_SIZE,
-        help=f"export input height; must be a positive multiple of {SCUNET_SIZE_MULTIPLE} (default: %(default)s)",
+        help="export input height; SCUNet supports arbitrary positive dimensions (default: %(default)s)",
     )
     parser.add_argument(
         "--width",
         type=int,
         default=DEFAULT_SIZE,
-        help=f"export input width; must be a positive multiple of {SCUNET_SIZE_MULTIPLE} (default: %(default)s)",
+        help="export input width; SCUNet supports arbitrary positive dimensions (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--output-suffix",
+        default="",
+        help="optional suffix appended to the checkpoint name before precision (for example: _tile128_halo128)",
     )
     parser.add_argument(
         "--dynamic-shapes",
@@ -49,10 +53,8 @@ def _parse_args(argv=None):
     )
     args = parser.parse_args(argv)
     for label, dimension in (("height", args.height), ("width", args.width)):
-        if dimension <= 0 or dimension % SCUNET_SIZE_MULTIPLE:
-            parser.error(
-                f"--{label} must be a positive multiple of {SCUNET_SIZE_MULTIPLE}"
-            )
+        if dimension <= 0:
+            parser.error(f"--{label} must be positive")
     return args
 
 
@@ -129,8 +131,8 @@ def _export(args):
         1, descriptor.input_channels, args.height, args.width, dtype=torch.float32
     )
     base_name = model_path.stem
-    fp32_path = output_dir / f"{base_name}_fp32.onnx"
-    fp16_path = output_dir / f"{base_name}_fp16.onnx"
+    fp32_path = output_dir / f"{base_name}{args.output_suffix}_fp32.onnx"
+    fp16_path = output_dir / f"{base_name}{args.output_suffix}_fp16.onnx"
     if args.precision == "fp16":
         temp_file = tempfile.NamedTemporaryFile(
             prefix=f"{base_name}_export_",

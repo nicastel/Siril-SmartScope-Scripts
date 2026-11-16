@@ -74,10 +74,15 @@
 # 2.0.5 - Fix : progess_callback in preview worker, now it updates the progress bar correctly during preview processing.
 #         Better error handling in image_inference_tensor to catch DirectML-related runtime errors and provide user-friendly messages about GPU compatibility issues.
 #         GUI improvements: model selection layout with two columns (Non-Linear only vs Linear & Non-Linear), added subtitles for clarity, and a vertical separator for better visual organization.
+# 2.0.6 - Windows inference uses ONNX Runtime DirectML; PyTorch DirectML is no longer required.
+#         Automatically select the OpenVINO GPU plugin when a compatible Intel GPU is detected.
 #
 
-VERSION = "2.0.5"
+from __future__ import annotations
 
+VERSION = "2.0.6"
+
+import importlib.util
 import sys
 import os
 import urllib.request
@@ -86,6 +91,8 @@ import math
 import zipfile
 import traceback
 import base64
+import subprocess
+import time
 
 # Attempt to import sirilpy. If not running inside Siril, the import will fail.
 try:
@@ -98,30 +105,35 @@ try:
 
     from sirilpy import SirilError
 
-    # 1. PyQt6 e Spandrel prima di Torch
-    s.ensure_installed("PyQt6", "spandrel", "torchvision")
+    s.ensure_installed("PyQt6")
 
 except ImportError as e:
     print(f"Warning: module imports failed: {e}")
     sys.exit(1)
 
-# 2. TorchHelper - fuori dal try, gestisce autonomamente CUDA/MPS/XPU
-th = s.TorchHelper()
-th.ensure_torch()
-
-# 3. DirectML fallback per Windows senza CUDA/XPU
-if sys.platform == "win32":
-    try:
-        import torch
-        if not torch.cuda.is_available() and not (hasattr(torch, 'xpu') and torch.xpu.is_available()):
-            s.ensure_installed("torch-directml")
-    except Exception:
-        pass
-
-import torch
-import numpy as np
-
-from spandrel import ImageModelDescriptor, ModelLoader
+_USE_ONNX_DIRECTML = sys.platform == "win32"
+_onnx_tools = None
+_OPENVINO_GPU_DEVICE = None
+if _USE_ONNX_DIRECTML:
+    onnx_helper_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "SCUNet_ONNX_Denoise.py"
+    )
+    onnx_spec = importlib.util.spec_from_file_location(
+        "scunet_onnx_denoise", onnx_helper_path
+    )
+    if onnx_spec is None or onnx_spec.loader is None:
+        raise RuntimeError(f"Could not load ONNX inference helpers: {onnx_helper_path}")
+    _onnx_tools = importlib.util.module_from_spec(onnx_spec)
+    onnx_spec.loader.exec_module(_onnx_tools)
+    _onnx_tools._ensure_runtime_dependencies(s, "directml")
+    import numpy as np
+    import onnxruntime as ort
+else:
+    s.ensure_installed("spandrel", "torchvision")
+    s.TorchHelper().ensure_torch()
+    import torch
+    import numpy as np
+    from spandrel import ImageModelDescriptor, ModelLoader
 
 # --- PyQt6 Imports ---
 from PyQt6.QtWidgets import (
@@ -135,9 +147,6 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject, QTimer
 
 
 
-_dml_device = None
-import math
-import numpy as np
 _GHS_BG_TARGET = 0.25
 _GHS_SHADOW_K = 0.0
 _GHS_D_SCALE = 1.5
@@ -321,24 +330,191 @@ def _mtf_display(data: np.ndarray, lo: float, mid: float, hi: float, boost: floa
     return np.clip(out, 0.0, 1.0).astype(np.float32)
 models_list = [['SCUNet Color Real PSNR', 'https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_psnr.pth', 'Best all around model but can be too aggressive on stars'], ['SCUNet Color Real GAN', 'https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_real_gan.pth', 'Less aggressive denoise'], ['SCUNet Color 15', 'https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_15.pth', 'Gaussian noise level 15'], ['SCUNet Color 25', 'https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_25.pth', 'Gaussian noise level 25'], ['SCUNet Color 50', 'https://github.com/cszn/KAIR/releases/download/v1.0/scunet_color_50.pth', 'Gaussian noise level 50'], ['UberSmooth dso stars 0.1', 'https://ubersmooth.com/uberSmooth-dso-stars-v0.1.zip', 'Pretty good on stars but too aggressive on Hii regions'], ['UberSmooth dso stars 0.2', 'https://ubersmooth.com/uberSmooth-dso-stars-v0.2.zip', 'Not as aggressive as UberSmooth 0.1, but also not great'], ['UberSmooth planetary 0.1', 'https://ubersmooth.com/uberSmooth-planetary-v0.1.zip', 'Only denoise/deblur no extra star treatment']]
 
-def _is_dml_device(device) -> bool:
-    return _dml_device is not None and device == _dml_device
+def _load_onnx_model(
+    siril,
+    checkpoint_path,
+    tile_size,
+    progress_callback=None,
+    provider="directml",
+):
+    requested_provider = provider
+    provider = _onnx_tools._select_windows_provider(
+        provider, _OPENVINO_GPU_DEVICE is not None
+    )
+    if provider == "openvino":
+        _onnx_tools._ensure_runtime_dependencies(s, provider)
+    checkpoint_path = os.path.abspath(checkpoint_path)
+    exporter_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "exportScunetToONNX.py"
+    )
+    if not os.path.isfile(exporter_path):
+        raise FileNotFoundError(f"SCUNet ONNX exporter not found: {exporter_path}")
+
+    def load_variant(core_size):
+        active_provider = provider
+        model_dimension = core_size + 2 * _onnx_tools.TILE_PAD
+        halo_size = _onnx_tools.TILE_PAD
+        suffix = f"_tile{core_size}_halo{halo_size}"
+        model_path = (
+            os.path.splitext(checkpoint_path)[0]
+            + suffix
+            + "_fp16.onnx"
+        )
+        if not os.path.isfile(model_path):
+            if progress_callback is not None:
+                progress_callback(
+                    f"Exporting SCUNet ONNX model for {core_size}px tiles..."
+                )
+            siril.log(
+                "No cached ONNX model found; PyTorch will run on CPU for "
+                "one-time model export only. Image inference will use "
+                f"ONNX Runtime {provider} ({core_size}px core + "
+                f"{_onnx_tools.TILE_PAD}px context).",
+                s.LogColor.BLUE,
+            )
+            command = [
+                sys.executable,
+                exporter_path,
+                checkpoint_path,
+                "--precision",
+                "fp16",
+                "--height",
+                str(model_dimension),
+                "--width",
+                str(model_dimension),
+                "--output-suffix",
+                suffix,
+            ]
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            for line in result.stdout.splitlines():
+                siril.log(line, s.LogColor.BLUE)
+            if result.returncode:
+                details = result.stderr.strip() or result.stdout.strip()
+                raise RuntimeError(
+                    f"Could not export {os.path.basename(checkpoint_path)} "
+                    f"for {core_size}px tiles to ONNX."
+                    + (f"\n{details}" if details else "")
+                )
+            if not os.path.isfile(model_path):
+                raise FileNotFoundError(
+                    f"ONNX exporter completed without creating {model_path}"
+                )
+        else:
+            siril.log(f"Using exported ONNX model: {model_path}", s.LogColor.BLUE)
+
+        siril.log(
+            f"Loading SCUNet ONNX model with {provider}; CPU execution-provider "
+            "fallback is disabled.",
+            s.LogColor.BLUE,
+        )
+        session, active_provider, fallback_error = (
+            _onnx_tools._create_windows_inference_session(
+                ort,
+                model_path,
+                requested_provider,
+                _OPENVINO_GPU_DEVICE is not None,
+            )
+        )
+        if fallback_error is not None:
+            siril.log(
+                "OpenVINO GPU could not activate this SCUNet model; "
+                f"switching explicitly to DirectML: {fallback_error}",
+                s.LogColor.RED,
+            )
+        input_shape = session.get_inputs()[0].shape
+        if (
+            len(input_shape) != 4
+            or input_shape[0] != 1
+            or input_shape[1] not in (1, 3)
+            or input_shape[2:] != [model_dimension, model_dimension]
+        ):
+            raise RuntimeError(
+                f"Expected a fixed one- or three-channel ONNX input with "
+                f"spatial shape {model_dimension}x{model_dimension}, got "
+                f"{input_shape} from {model_path}."
+            )
+        return session, active_provider
+
+    core_size = 128 if tile_size == "Auto" else int(tile_size)
+    if tile_size == "Auto":
+        siril.log(
+            f"{provider} Auto tile size is fixed at 128px to reduce the risk "
+            "of a Windows GPU timeout (TDR).",
+            s.LogColor.BLUE,
+        )
+    session, provider = load_variant(core_size)
+    return session, core_size, provider
+
+
+def _detect_openvino_gpu(siril):
+    global _OPENVINO_GPU_DEVICE
+    _OPENVINO_GPU_DEVICE = None
+    try:
+        _onnx_tools._ensure_runtime_dependencies(s, "openvino")
+        _OPENVINO_GPU_DEVICE = _onnx_tools._get_openvino_gpu_device(ort)
+    except Exception as error:
+        siril.log(
+            "OpenVINO GPU auto-detection failed; using DirectML by default. "
+            f"Reason: {error}",
+            s.LogColor.RED,
+        )
+        return None
+
+    if _OPENVINO_GPU_DEVICE is None:
+        siril.log(
+            "No OpenVINO-compatible Intel GPU detected; using DirectML by default.",
+            s.LogColor.BLUE,
+        )
+    else:
+        device_name = _OPENVINO_GPU_DEVICE.ep_metadata.get(
+            "FULL_DEVICE_NAME", "Intel GPU"
+        )
+        siril.log(
+            f"OpenVINO-compatible GPU detected: {device_name}; selecting "
+            "OpenVINO automatically (CPU fallback disabled).",
+            s.LogColor.GREEN,
+        )
+    return _OPENVINO_GPU_DEVICE
+
+
+def _onnx_tile_size(session, requested_size):
+    input_shape = session.get_inputs()[0].shape
+    if (
+        len(input_shape) != 4
+        or not isinstance(input_shape[2], int)
+        or not isinstance(input_shape[3], int)
+    ):
+        raise ValueError(
+            "The Windows ONNX backends require a fixed-shape model. "
+            "Re-export the selected checkpoint without --dynamic-shapes."
+        )
+    core_height = input_shape[2] - 2 * _onnx_tools.TILE_PAD
+    core_width = input_shape[3] - 2 * _onnx_tools.TILE_PAD
+    if core_height <= 0 or core_height != core_width:
+        raise ValueError(
+            "ONNX model dimensions must equal the tile core plus "
+            f"{2 * _onnx_tools.TILE_PAD}px of context."
+        )
+    if requested_size != "Auto" and int(requested_size) != core_height:
+        raise ValueError(
+            f"The ONNX model was exported for {core_height}px tile cores, "
+            f"but {requested_size}px was requested."
+        )
+    return core_height
+
 
 def get_device() -> torch.device:
-    global _dml_device
     if torch.cuda.is_available():
         return torch.device('cuda')
     if torch.backends.mps.is_available():
         return torch.device('mps')
     if hasattr(torch, 'xpu') and torch.xpu.is_available():
         return torch.device('xpu')
-    if sys.platform == 'win32':
-        try:
-            import torch_directml
-            _dml_device = torch_directml.device()
-            return _dml_device
-        except Exception:
-            pass
     return torch.device('cpu')
 
 def image_to_tensor(device: torch.device, img: np.ndarray) -> torch.Tensor:
@@ -358,7 +534,7 @@ def image_inference_tensor(model: ImageModelDescriptor, tensor: torch.Tensor) ->
             raise
 
 def determine_optimal_tile_size(model, device, start_size=512):
-    if device.type == 'cpu' or _is_dml_device(device):
+    if device.type == 'cpu':
         return 256
     test_sizes = [512, 384, 256, 128]
     test_sizes = [s for s in test_sizes if s <= start_size]
@@ -451,7 +627,55 @@ def tile_process(device, model, data, scale, tile_size, yield_extra_details=Fals
                 yield output_tile
     yield None
 
-def process_image_buffer(image_data, model, device, strength, tile_size, progress_callback=None, apply_prestretch=False, precomputed_ghs_params=None):
+def process_image_buffer(image_data, model, device, strength, tile_size, progress_callback=None, apply_prestretch=False, precomputed_ghs_params=None, provider="directml"):
+    if _USE_ONNX_DIRECTML:
+        from types import SimpleNamespace
+
+        final_tile_size = _onnx_tile_size(model, tile_size)
+        input_meta = model.get_inputs()[0]
+        output_meta = model.get_outputs()[0]
+
+        def onnx_progress(done, total, tile_elapsed, inference_elapsed):
+            if progress_callback is None:
+                return True
+            return progress_callback(
+                done / total,
+                tile_elapsed,
+                inference_elapsed,
+            )
+
+        args = SimpleNamespace(
+            provider=provider,
+            tile_size=final_tile_size,
+            strength=strength,
+            pre_stretch=apply_prestretch,
+        )
+        if isinstance(precomputed_ghs_params, (list, tuple)):
+            precomputed_ghs_params = precomputed_ghs_params[0]
+        if precomputed_ghs_params is not None and "d" not in precomputed_ghs_params:
+            precomputed_ghs_params = {
+                "lp": precomputed_ghs_params["LP"],
+                "sp": precomputed_ghs_params["SP"],
+                "d": precomputed_ghs_params["D"],
+                "a": precomputed_ghs_params["A"],
+                "b": precomputed_ghs_params["B"],
+                "hp_norm": precomputed_ghs_params["hp_norm"],
+            }
+        try:
+            result, _ = _onnx_tools._process_image(
+                np,
+                model,
+                image_data,
+                args,
+                input_meta,
+                output_meta,
+                progress_callback=onnx_progress,
+                precomputed_ghs_params=precomputed_ghs_params,
+            )
+        except _onnx_tools.InferenceCancelled:
+            return None
+        return result
+
     original_dtype = image_data.dtype
     if original_dtype == np.uint8:
         pixel_data = image_data.astype(np.float32) / 255.0
@@ -544,6 +768,8 @@ class ProcessingWorker(QObject):
             is_sequence = self.params['is_sequence']
             seq_prefix = self.params['seq_prefix']
             apply_prestretch = self.params.get('apply_prestretch', False)
+            provider = self.params.get('provider', 'directml')
+            req_tile = self.params['tile_size']
             self.progress_update.emit(0, 'Checking Model...')
             user_dir = self.siril.get_siril_userdatadir()
             models_dir = os.path.join(user_dir, 'scunet_models')
@@ -579,40 +805,72 @@ class ProcessingWorker(QObject):
                     zip_ref.extractall(models_dir)
                     modelpath = modelpath.replace('.zip', '.pth')
             self.progress_update.emit(0, 'Loading Model into Memory...')
-            device = get_device()
-            self.siril.log('------ Hardware Info ------', s.LogColor.BLUE)
-            cuda_available = torch.cuda.is_available()
-            self.siril.log(f'CUDA Available: {cuda_available}', s.LogColor.GREEN if cuda_available else s.LogColor.RED)
-            if cuda_available:
-                num_gpus = torch.cuda.device_count()
-                for i in range(num_gpus):
-                    self.siril.log(f'  - GPU {i}: {torch.cuda.get_device_name(i)}', s.LogColor.GREEN)
-            mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-            self.siril.log(f'MPS (Apple) Available: {mps_available}', s.LogColor.GREEN if mps_available else s.LogColor.RED)
-            xpu_available = hasattr(torch, 'xpu') and torch.xpu.is_available()
-            self.siril.log(f'XPU (Intel) Available: {xpu_available}', s.LogColor.GREEN if xpu_available else s.LogColor.RED)
-            dml_available = _is_dml_device(device)
-            self.siril.log(f'DirectML (Windows) Available: {dml_available}', s.LogColor.GREEN if dml_available else s.LogColor.RED)
-            self.siril.log(f"Active Device: {('DirectML' if dml_available else device.type.upper())}", s.LogColor.BLUE)
-            self.siril.log('---------------------------', s.LogColor.BLUE)
-            if device.type == 'cuda':
-                device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'Unknown NVIDIA GPU'
-                self.siril.log(f'Acceleration: CUDA ({device_name})', s.LogColor.GREEN)
-            elif device.type == 'mps':
-                self.siril.log('Acceleration: Apple Metal Performance Shaders (MPS)', s.LogColor.GREEN)
-            elif device.type == 'xpu':
-                self.siril.log('Acceleration: Intel XPU (Arc GPU detected)', s.LogColor.GREEN)
-            elif dml_available:
-                self.siril.log('Acceleration: DirectML (Windows GPU fallback)', s.LogColor.GREEN)
+            if _USE_ONNX_DIRECTML:
+                model, auto_tile_size, provider = _load_onnx_model(
+                    self.siril,
+                    modelpath,
+                    req_tile,
+                    lambda message: self.progress_update.emit(0, message),
+                    provider=provider,
+                )
+                device = None
+                backend_name = (
+                    "ONNX Runtime DirectML"
+                    if provider == "directml"
+                    else f"ONNX Runtime OpenVINO GPU ({_onnx_tools._OPENVINO_SELECTED_DEVICE})"
+                )
+                self.siril.log(
+                    f"SCUNet inference backend: {backend_name} "
+                    "(CPU execution-provider fallback disabled).",
+                    s.LogColor.GREEN,
+                )
+                self.siril.log(
+                    f"ONNX Runtime registered providers: {', '.join(model.get_providers())}",
+                    s.LogColor.BLUE,
+                )
             else:
-                self.siril.log('Acceleration: CPU (No GPU detected)', s.LogColor.GREEN)
-            model = ModelLoader().load_from_file(str(modelpath)).eval().to(device)
-            architecture_name = type(model.model).__name__
-            if 'SCUNet' not in architecture_name:
-                raise RuntimeError(f"Invalid model selected. Expected a SCUNet model, but detected: '{architecture_name}'.\nPlease select a valid SCUNet .pth file.")
-            assert isinstance(model, ImageModelDescriptor)
-            req_tile = self.params['tile_size']
-            if req_tile == 'Auto':
+                device = get_device()
+                self.siril.log('------ Hardware Info ------', s.LogColor.BLUE)
+                cuda_available = torch.cuda.is_available()
+                self.siril.log(f'CUDA Available: {cuda_available}', s.LogColor.GREEN if cuda_available else s.LogColor.RED)
+                if cuda_available:
+                    num_gpus = torch.cuda.device_count()
+                    for i in range(num_gpus):
+                        self.siril.log(f'  - GPU {i}: {torch.cuda.get_device_name(i)}', s.LogColor.GREEN)
+                mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                self.siril.log(f'MPS (Apple) Available: {mps_available}', s.LogColor.GREEN if mps_available else s.LogColor.RED)
+                xpu_available = hasattr(torch, 'xpu') and torch.xpu.is_available()
+                self.siril.log(f'XPU (Intel) Available: {xpu_available}', s.LogColor.GREEN if xpu_available else s.LogColor.RED)
+                self.siril.log(f"Active Device: {device.type.upper()}", s.LogColor.BLUE)
+                self.siril.log('---------------------------', s.LogColor.BLUE)
+                if device.type == 'cuda':
+                    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'Unknown NVIDIA GPU'
+                    self.siril.log(f'Acceleration: CUDA ({device_name})', s.LogColor.GREEN)
+                elif device.type == 'mps':
+                    self.siril.log('Acceleration: Apple Metal Performance Shaders (MPS)', s.LogColor.GREEN)
+                elif device.type == 'xpu':
+                    self.siril.log('Acceleration: Intel XPU (Arc GPU detected)', s.LogColor.GREEN)
+                else:
+                    self.siril.log('Acceleration: CPU (No GPU detected)', s.LogColor.GREEN)
+                model = ModelLoader().load_from_file(str(modelpath)).eval().to(device)
+                architecture_name = type(model.model).__name__
+                if 'SCUNet' not in architecture_name:
+                    raise RuntimeError(f"Invalid model selected. Expected a SCUNet model, but detected: '{architecture_name}'.\nPlease select a valid SCUNet .pth file.")
+                assert isinstance(model, ImageModelDescriptor)
+            if _USE_ONNX_DIRECTML:
+                final_tile_size = (
+                    auto_tile_size
+                    if req_tile == 'Auto'
+                    else _onnx_tile_size(model, req_tile)
+                )
+                provider_label = (
+                    "DirectML" if provider == "directml" else "OpenVINO GPU"
+                )
+                self.siril.log(
+                    f'ONNX {provider_label} tile size: {final_tile_size}px',
+                    s.LogColor.GREEN,
+                )
+            elif req_tile == 'Auto':
                 self.progress_update.emit(0, 'Auto-tuning Tile Size...')
                 final_tile_size = determine_optimal_tile_size(model, device)
                 self.siril.log(f'Auto-Tuning: Selected Tile Size {final_tile_size}px', s.LogColor.GREEN)
@@ -637,17 +895,34 @@ class ProcessingWorker(QObject):
                     image_data = ffit_image.data
                     header = ffit_image.header
 
-                    def callback(tile_p):
+                    frame_started = time.perf_counter()
+                    inference_totals = [0.0]
+
+                    def callback(tile_p, tile_elapsed=None, inference_elapsed=None):
                         if not self._is_running:
                             return False
                         global_p = (i + tile_p) / num_images
-                        self.progress_update.emit(int(global_p * 100), f'Processing frame {i + 1}/{num_images}')
+                        status = f'Processing frame {i + 1}/{num_images}'
+                        if tile_elapsed is not None:
+                            inference_totals[0] = inference_elapsed
+                            status += (
+                                f' | tile {tile_elapsed:.2f}s'
+                                f' | inference {inference_elapsed:.2f}s'
+                            )
+                        self.progress_update.emit(int(global_p * 100), status)
                         return True
-                    processed_data = process_image_buffer(image_data, model, device, strength, final_tile_size, callback, apply_prestretch=apply_prestretch)
+                    processed_data = process_image_buffer(image_data, model, device, strength, final_tile_size, callback, apply_prestretch=apply_prestretch, provider=provider)
                     if processed_data is None:
                         self.siril.log('Processing cancelled. No data saved.', s.LogColor.RED)
                         self.finished.emit()
                         return
+                    if _USE_ONNX_DIRECTML:
+                        self.siril.log(
+                            f'SCUNet timing frame {i + 1}: inference '
+                            f'{inference_totals[0]:.2f}s; total '
+                            f'{time.perf_counter() - frame_started:.2f}s',
+                            s.LogColor.BLUE,
+                        )
                     new_filename = f'{seq_prefix}{i + 1:05d}{file_extension}'
                     self.siril.save_image_file(processed_data, header=header, filename=new_filename)
                 self.progress_update.emit(100, f'Sequence saved: {seq_prefix}...')
@@ -657,16 +932,33 @@ class ProcessingWorker(QObject):
                 image = self.siril.get_image()
                 image_data = image.data
 
-                def callback(tile_p):
+                image_started = time.perf_counter()
+                inference_totals = [0.0]
+
+                def callback(tile_p, tile_elapsed=None, inference_elapsed=None):
                     if not self._is_running:
                         return False
-                    self.progress_update.emit(int(tile_p * 100), 'Denoising Image...')
+                    status = 'Denoising Image...'
+                    if tile_elapsed is not None:
+                        inference_totals[0] = inference_elapsed
+                        status += (
+                            f' | tile {tile_elapsed:.2f}s'
+                            f' | inference {inference_elapsed:.2f}s'
+                        )
+                    self.progress_update.emit(int(tile_p * 100), status)
                     return True
-                processed_data = process_image_buffer(image_data, model, device, strength, final_tile_size, callback, apply_prestretch=apply_prestretch)
+                processed_data = process_image_buffer(image_data, model, device, strength, final_tile_size, callback, apply_prestretch=apply_prestretch, provider=provider)
                 if processed_data is None:
                     self.siril.log('Processing cancelled. No data saved.', s.LogColor.RED)
                     self.finished.emit()
                     return
+                if _USE_ONNX_DIRECTML:
+                    self.siril.log(
+                        f'SCUNet timing: model inference '
+                        f'{inference_totals[0]:.2f}s; total processing '
+                        f'{time.perf_counter() - image_started:.2f}s',
+                        s.LogColor.BLUE,
+                    )
                 try:
                     model_name = next((m[0] for m in models_list if m[1] == self.params['model_url']), 'Unknown Model')
                     self.siril.undo_save_state(f'SCUNet denoise - {model_name} | Strength: {strength:.2f}')
@@ -738,6 +1030,7 @@ class PreviewWorker(QObject):
             model_url = self.params['model_url']
             strength = self.params['strength']
             apply_prestretch = self.params.get('apply_prestretch', False)
+            provider = self.params.get('provider', 'directml')
             user_dir = self.siril.get_siril_userdatadir()
             models_dir = os.path.join(user_dir, 'scunet_models')
             if not os.path.exists(models_dir):
@@ -762,47 +1055,86 @@ class PreviewWorker(QObject):
                 with zipfile.ZipFile(modelpath, 'r') as zip_ref:
                     zip_ref.extractall(models_dir)
                     modelpath = modelpath.replace('.zip', '.pth')
-            self.progress_update.emit(0, 'Loading Model into Memory...')
-            device = get_device()
-            self.siril.log('------ Hardware Info ------', s.LogColor.BLUE)
-            cuda_available = torch.cuda.is_available()
-            self.siril.log(f'CUDA Available: {cuda_available}', s.LogColor.GREEN if cuda_available else s.LogColor.RED)
-            if cuda_available:
-                num_gpus = torch.cuda.device_count()
-                for i in range(num_gpus):
-                    self.siril.log(f'  - GPU {i}: {torch.cuda.get_device_name(i)}', s.LogColor.GREEN)
-            mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
-            self.siril.log(f'MPS (Apple) Available: {mps_available}', s.LogColor.GREEN if mps_available else s.LogColor.RED)
-            xpu_available = hasattr(torch, 'xpu') and torch.xpu.is_available()
-            self.siril.log(f'XPU (Intel) Available: {xpu_available}', s.LogColor.GREEN if xpu_available else s.LogColor.RED)
-            dml_available = _is_dml_device(device)
-            self.siril.log(f'DirectML (Windows) Available: {dml_available}', s.LogColor.GREEN if dml_available else s.LogColor.RED)
-            self.siril.log(f"Active Device: {('DirectML' if dml_available else device.type.upper())}", s.LogColor.BLUE)
-            self.siril.log('---------------------------', s.LogColor.BLUE)
-            if device.type == 'cuda':
-                device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'Unknown NVIDIA GPU'
-                self.siril.log(f'Acceleration: CUDA ({device_name})', s.LogColor.GREEN)
-            elif device.type == 'mps':
-                self.siril.log('Acceleration: Apple Metal Performance Shaders (MPS)', s.LogColor.GREEN)
-            elif device.type == 'xpu':
-                self.siril.log('Acceleration: Intel XPU (Arc GPU detected)', s.LogColor.GREEN)
-            elif dml_available:
-                self.siril.log('Acceleration: DirectML (Windows GPU fallback)', s.LogColor.GREEN)
-            else:
-                self.siril.log('Acceleration: CPU (No GPU detected)', s.LogColor.GREEN)
-            model = ModelLoader().load_from_file(str(modelpath)).eval().to(device)
             if self.img_data.ndim == 3:
                 h_img, w_img = (self.img_data.shape[1], self.img_data.shape[2])
             else:
                 h_img, w_img = (self.img_data.shape[0], self.img_data.shape[1])
-            tile_size = min(512, h_img, w_img)
+            tile_size = min(128 if _USE_ONNX_DIRECTML else 512, h_img, w_img)
+            self.progress_update.emit(0, 'Loading Model into Memory...')
+            if _USE_ONNX_DIRECTML:
+                model, tile_size, provider = _load_onnx_model(
+                    self.siril,
+                    modelpath,
+                    tile_size,
+                    lambda message: self.progress_update.emit(0, message),
+                    provider=provider,
+                )
+                device = None
+                backend_name = (
+                    "ONNX Runtime DirectML"
+                    if provider == "directml"
+                    else f"ONNX Runtime OpenVINO GPU ({_onnx_tools._OPENVINO_SELECTED_DEVICE})"
+                )
+                self.siril.log(
+                    f"SCUNet preview backend: {backend_name} "
+                    "(CPU execution-provider fallback disabled).",
+                    s.LogColor.GREEN,
+                )
+                self.siril.log(
+                    f"ONNX Runtime registered providers: {', '.join(model.get_providers())}",
+                    s.LogColor.BLUE,
+                )
+            else:
+                device = get_device()
+                self.siril.log('------ Hardware Info ------', s.LogColor.BLUE)
+                cuda_available = torch.cuda.is_available()
+                self.siril.log(f'CUDA Available: {cuda_available}', s.LogColor.GREEN if cuda_available else s.LogColor.RED)
+                if cuda_available:
+                    num_gpus = torch.cuda.device_count()
+                    for i in range(num_gpus):
+                        self.siril.log(f'  - GPU {i}: {torch.cuda.get_device_name(i)}', s.LogColor.GREEN)
+                mps_available = hasattr(torch.backends, 'mps') and torch.backends.mps.is_available()
+                self.siril.log(f'MPS (Apple) Available: {mps_available}', s.LogColor.GREEN if mps_available else s.LogColor.RED)
+                xpu_available = hasattr(torch, 'xpu') and torch.xpu.is_available()
+                self.siril.log(f'XPU (Intel) Available: {xpu_available}', s.LogColor.GREEN if xpu_available else s.LogColor.RED)
+                self.siril.log(f"Active Device: {device.type.upper()}", s.LogColor.BLUE)
+                self.siril.log('---------------------------', s.LogColor.BLUE)
+                if device.type == 'cuda':
+                    device_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'Unknown NVIDIA GPU'
+                    self.siril.log(f'Acceleration: CUDA ({device_name})', s.LogColor.GREEN)
+                elif device.type == 'mps':
+                    self.siril.log('Acceleration: Apple Metal Performance Shaders (MPS)', s.LogColor.GREEN)
+                elif device.type == 'xpu':
+                    self.siril.log('Acceleration: Intel XPU (Arc GPU detected)', s.LogColor.GREEN)
+                else:
+                    self.siril.log('Acceleration: CPU (No GPU detected)', s.LogColor.GREEN)
+                model = ModelLoader().load_from_file(str(modelpath)).eval().to(device)
+            if _USE_ONNX_DIRECTML:
+                tile_size = _onnx_tile_size(model, tile_size)
             self.siril.log(f'Tile Size {tile_size}px', s.LogColor.GREEN)
 
-            def callback(tile_p):
-                self.progress_update.emit(int(tile_p * 100), 'Processing ROI Preview...')
+            preview_started = time.perf_counter()
+            inference_totals = [0.0]
+
+            def callback(tile_p, tile_elapsed=None, inference_elapsed=None):
+                status = 'Processing ROI Preview...'
+                if tile_elapsed is not None:
+                    inference_totals[0] = inference_elapsed
+                    status += (
+                        f' | tile {tile_elapsed:.2f}s'
+                        f' | inference {inference_elapsed:.2f}s'
+                    )
+                self.progress_update.emit(int(tile_p * 100), status)
                 return True
             precomputed_ghs_params = self.params.get('precomputed_ghs_params', None)
-            processed_roi = process_image_buffer(self.img_data, model, device, strength, tile_size, progress_callback=callback, apply_prestretch=apply_prestretch, precomputed_ghs_params=precomputed_ghs_params)
+            processed_roi = process_image_buffer(self.img_data, model, device, strength, tile_size, progress_callback=callback, apply_prestretch=apply_prestretch, precomputed_ghs_params=precomputed_ghs_params, provider=provider)
+            if _USE_ONNX_DIRECTML:
+                self.siril.log(
+                    f'SCUNet preview timing: model inference '
+                    f'{inference_totals[0]:.2f}s; total processing '
+                    f'{time.perf_counter() - preview_started:.2f}s',
+                    s.LogColor.BLUE,
+                )
             self.finished.emit(processed_roi)
             self.progress_update.emit(0, 'Completed / Ready')
         except Exception as e:
@@ -1051,6 +1383,23 @@ class ScunetWindow(QWidget):
         except Exception:
             QMessageBox.critical(self, 'Connection Error', 'Connection to Siril failed. Make sure Siril is open and ready.')
             sys.exit(1)
+        if _USE_ONNX_DIRECTML:
+            _detect_openvino_gpu(self.siril)
+        backend_name = (
+            (
+                "ONNX Runtime OpenVINO GPU "
+                f"({_OPENVINO_GPU_DEVICE.ep_metadata.get('FULL_DEVICE_NAME', 'Intel GPU')})"
+                if _OPENVINO_GPU_DEVICE is not None
+                else "ONNX Runtime DirectML"
+            )
+            + " (CPU EP fallback disabled)"
+            if _USE_ONNX_DIRECTML
+            else "PyTorch"
+        )
+        self.siril.log(
+            f"SCUNet Denoise v{VERSION}; selected backend: {backend_name}.",
+            s.LogColor.GREEN,
+        )
         try:
             self.siril.cmd('requires', '1.4.2')
         except s.CommandError:
@@ -1141,10 +1490,31 @@ class ScunetWindow(QWidget):
         h_tile = QHBoxLayout()
         self.combo_tile = QComboBox()
         self.combo_tile.addItems(['Auto', '512', '384', '256', '128'])
-        self.combo_tile.setToolTip("Tile size for processing.\n'Auto' tests VRAM to find the best size.\nLower values save memory but may be slower.")
+        self.combo_tile.setToolTip(
+            "Tile size for processing.\n"
+            "'Auto' selects 128px on Windows and tunes to the available device elsewhere.\n"
+            "Windows exports a fixed ONNX input with 128px of context around the selected tile core."
+        )
         h_tile.addWidget(QLabel('Tile Size:'))
         h_tile.addWidget(self.combo_tile)
         layout_params.addLayout(h_tile)
+        if _USE_ONNX_DIRECTML:
+            h_backend = QHBoxLayout()
+            self.combo_backend = QComboBox()
+            self.combo_backend.addItem(
+                'Automatic (OpenVINO GPU if detected)', 'auto'
+            )
+            self.combo_backend.addItem('DirectML', 'directml')
+            self.combo_backend.addItem('OpenVINO GPU (manual)', 'openvino')
+            self.combo_backend.setToolTip(
+                "Automatic selects the compatible Intel OpenVINO GPU when "
+                "available; otherwise it uses DirectML. If OpenVINO cannot "
+                "activate the selected model, Automatic explicitly retries "
+                "with DirectML. CPU inference-provider fallback stays disabled."
+            )
+            h_backend.addWidget(QLabel('Windows backend:'))
+            h_backend.addWidget(self.combo_backend)
+            layout_params.addLayout(h_backend)
         gb_params.setLayout(layout_params)
         layout.addWidget(gb_params)
         gb_linear = QGroupBox('Linear Image Options')
@@ -1217,7 +1587,14 @@ class ScunetWindow(QWidget):
                 selected_url = rb.property('url')
                 break
         strength_val = self.slider_strength.value() / 100.0
-        preview_params = {'model_url': selected_url, 'strength': strength_val, 'apply_prestretch': self.chk_prestretch.isChecked()}
+        preview_params = {
+            'model_url': selected_url,
+            'strength': strength_val,
+            'apply_prestretch': self.chk_prestretch.isChecked(),
+            'provider': self.combo_backend.currentData()
+            if _USE_ONNX_DIRECTML
+            else 'directml',
+        }
         if not hasattr(self, 'preview_window') or not self.preview_window.isVisible():
             self.btn_preview.setText('Update ROI Preview')
             self.preview_window = PreviewWindow(self.siril, preview_params)
@@ -1250,7 +1627,17 @@ class ScunetWindow(QWidget):
         strength_val = self.slider_strength.value() / 100.0
         tile_choice = self.combo_tile.currentText()
         tile_param = 'Auto' if tile_choice == 'Auto' else int(tile_choice)
-        params = {'model_url': selected_url, 'strength': strength_val, 'tile_size': tile_param, 'is_sequence': self.chk_seq.isChecked(), 'seq_prefix': self.txt_prefix.text(), 'apply_prestretch': self.chk_prestretch.isChecked()}
+        params = {
+            'model_url': selected_url,
+            'strength': strength_val,
+            'tile_size': tile_param,
+            'is_sequence': self.chk_seq.isChecked(),
+            'seq_prefix': self.txt_prefix.text(),
+            'apply_prestretch': self.chk_prestretch.isChecked(),
+            'provider': self.combo_backend.currentData()
+            if _USE_ONNX_DIRECTML
+            else 'directml',
+        }
         self.thread = QThread()
         self.worker = ProcessingWorker(self.siril, params)
         self.worker.moveToThread(self.thread)
